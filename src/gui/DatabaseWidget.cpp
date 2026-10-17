@@ -241,6 +241,7 @@ DatabaseWidget::DatabaseWidget(QSharedPointer<Database> db, QWidget* parent)
     m_deviceSaveTimer->setInterval(DeviceSaveDelayMs);
     connect(m_deviceSaveTimer, &QTimer::timeout, this, [this] {
         if (m_db->isModified()) {
+            m_deviceSaveTrigger = QStringLiteral("automatic, after a change");
             save();
         }
     });
@@ -2096,6 +2097,12 @@ bool DatabaseWidget::lock()
         }
     }
 
+    if (isOnDevice()) {
+        qCInfo(lcYubiKey).noquote() << QString("lock: %1, modified %2, non-data changes %3")
+                                           .arg(m_db->filePath())
+                                           .arg(m_db->isModified())
+                                           .arg(m_db->hasNonDataChanges());
+    }
     if (m_db->isModified()) {
         bool saved = false;
         // Attempt to save on exit, but don't block locking if it fails.  A
@@ -2103,6 +2110,7 @@ bool DatabaseWidget::lock()
         if (config()->get(Config::AutoSaveOnExit).toBool() || config()->get(Config::AutoSaveAfterEveryChange).toBool()
             || isOnDevice()) {
             m_deviceSaveTimer->stop();
+            m_deviceSaveTrigger = QStringLiteral("lock, close or exit");
             saved = save();
 
             if (!saved) {
@@ -2539,6 +2547,16 @@ bool DatabaseWidget::save()
     // Read-only and new databases ask for filename
     if (m_db->filePath().isEmpty()) {
         return saveAs();
+    }
+
+    if (isOnDevice()) {
+        qCInfo(lcYubiKey).noquote() << QString("save: %1, trigger %2, modified %3, non-data changes %4")
+                                           .arg(m_db->filePath(),
+                                                m_deviceSaveTrigger.isEmpty() ? QStringLiteral("Save")
+                                                                              : m_deviceSaveTrigger)
+                                           .arg(m_db->isModified())
+                                           .arg(m_db->hasNonDataChanges());
+        m_deviceSaveTrigger.clear();
     }
 
     // Prevent recursions and infinite save loops

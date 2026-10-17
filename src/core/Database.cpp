@@ -1154,6 +1154,21 @@ bool Database::hasNonDataChanges() const
 
 void Database::markAsModified()
 {
+    // KeePassYB: why a vault on the YubiKey counts as modified, once per
+    // change since the last save (yb spec 0047 S1).
+    if (!m_modified && DeviceStorage::isDeviceLocation(m_data.filePath)) {
+        if (const auto* source = sender()) {
+            const auto signal = source->metaObject()->method(senderSignalIndex()).name();
+            qCInfo(lcYubiKey).noquote() << QString("modified: %1, first by %2::%3 (%4)")
+                                               .arg(m_data.filePath,
+                                                    source->metaObject()->className(),
+                                                    QString::fromLatin1(signal),
+                                                    source->objectName());
+        } else {
+            // A direct call: `break Database::markAsModified` in gdb names it.
+            qCInfo(lcYubiKey).noquote() << QString("modified: %1, first by a direct call").arg(m_data.filePath);
+        }
+    }
     m_modified = true;
     if (modifiedSignalEnabled() && !m_modifiedTimer.isActive()) {
         // Small time delay prevents numerous consecutive saves due to repeated signals
@@ -1174,6 +1189,9 @@ void Database::markAsClean()
 
 void Database::markNonDataChange()
 {
+    if (!m_hasNonDataChange && DeviceStorage::isDeviceLocation(m_data.filePath)) {
+        qCInfo(lcYubiKey).noquote() << QString("non-data change: %1 (never written by itself)").arg(m_data.filePath);
+    }
     m_hasNonDataChange = true;
     emit databaseNonDataChanged();
 }

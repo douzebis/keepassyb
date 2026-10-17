@@ -21,6 +21,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QList>
+#include <QLoggingCategory>
 #include <QSet>
 #include <QString>
 #include <QStringList>
@@ -51,6 +52,12 @@
  * Reads are served from a cache of the bytes, checked against the device
  * without the PIN; writes go to the device at once (write-through).
  */
+/// KeePassYB's YubiKey log (yb spec 0047 S1), off by default:
+/// QT_LOGGING_RULES="keepassyb.yubikey=true" (info level, as KeePassXC
+/// builds without debug output).  Never logs a PIN, a
+/// password or content.
+Q_DECLARE_LOGGING_CATEGORY(lcYubiKey)
+
 class DeviceStorage
 {
 public:
@@ -231,6 +238,10 @@ private:
     QString describe(Status status, const QString& detail, const QString& blob, int pinTries, StoreKind kind) const;
     /// Run `f` on the GUI thread (prompts), blocking the calling thread.
     void onGuiThread(const std::function<void()>& f) const;
+
+    friend class OpLog;
+    /// The operation being timed, if any (operations do not overlap).
+    class OpLog* m_op = nullptr;
 
     std::unique_ptr<Backend> m_backend;
     PinPrompt m_pinPrompt;

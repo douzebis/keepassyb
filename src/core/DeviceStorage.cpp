@@ -20,11 +20,69 @@
 #include "config-keepassx.h"
 
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QThread>
 
 #ifdef KPXC_FEATURE_YUBIBLOB
 #include <yubiblob.h>
 #endif
+
+Q_LOGGING_CATEGORY(lcYubiKey, "keepassyb.yubikey", QtWarningMsg)
+
+/**
+ * Times one operation on the YubiKey and logs it when it ends (yb spec 0047
+ * S1): the total, split into waiting for the PIN prompt, waiting for a
+ * touch (from the touch callback to the end), and the YubiKey itself.
+ */
+class OpLog
+{
+public:
+    OpLog(DeviceStorage* storage, const char* what, const QString& blob)
+        : m_storage(storage)
+        , m_what(what)
+        , m_blob(blob)
+    {
+        m_total.start();
+        m_storage->m_op = this;
+    }
+
+    ~OpLog()
+    {
+        m_storage->m_op = nullptr;
+        const auto total = m_total.elapsed();
+        const auto touch = m_touch.isValid() ? m_touch.elapsed() : 0;
+        qCInfo(lcYubiKey).noquote() << QString("%1 %2: %3 in %4 ms (PIN prompt %5 ms, touch %6 ms, YubiKey %7 ms)")
+                                           .arg(m_what, m_blob, m_outcome)
+                                           .arg(total)
+                                           .arg(m_pinMs)
+                                           .arg(touch)
+                                           .arg(total - m_pinMs - touch);
+    }
+
+    void outcome(const QString& outcome)
+    {
+        m_outcome = outcome;
+    }
+    void addPinWait(qint64 ms)
+    {
+        m_pinMs += ms;
+    }
+    void touchStarted()
+    {
+        if (!m_touch.isValid()) {
+            m_touch.start();
+        }
+    }
+
+private:
+    DeviceStorage* m_storage;
+    QString m_what;
+    QString m_blob;
+    QString m_outcome = QStringLiteral("failed");
+    QElapsedTimer m_total;
+    QElapsedTimer m_touch;
+    qint64 m_pinMs = 0;
+};
 
 namespace
 {
@@ -449,7 +507,15 @@ bool DeviceStorage::pinFor(const QString& serial, StoreKind kind, QByteArray* pi
     if (!m_pins.contains(serial)) {
         QString entered;
         if (m_pinPrompt) {
+            QElapsedTimer waited;
+            waited.start();
             onGuiThread([&] { entered = m_pinPrompt(serial, kind); });
+            if (m_op) {
+                m_op->addPinWait(waited.elapsed());
+            }
+            qCInfo(lcYubiKey).noquote() << QString("%1 prompt: %2 after %3 ms")
+                                               .arg(pinName(kind), entered.isNull() ? "cancelled" : "entered")
+                                               .arg(waited.elapsed());
         }
         if (entered.isNull()) {
             *error = tr("The YubiKey's %1 is needed.").arg(pinName(kind));
@@ -476,7 +542,11 @@ bool DeviceStorage::find(const QString& serial, const QString& blob, BlobInfo* i
 {
     QList<BlobInfo> blobs;
     QString detail;
+    QElapsedTimer listed;
+    listed.start();
     *status = m_backend->list(serial, &blobs, &detail);
+    qCInfo(lcYubiKey).noquote()
+        << QString("list (for %1): status %2 in %3 ms").arg(blob).arg(*status).arg(listed.elapsed());
     if (*status != Ok) {
         *error = describe(*status, detail, blob, -1, StoreKind::Legacy);
         return false;
@@ -551,6 +621,7 @@ bool DeviceStorage::read(const QString& location, QByteArray* data, QString* err
         *error = tr("Not a device location: %1").arg(location);
         return false;
     }
+    OpLog op(this, "read", blob);
     BlobInfo info;
     Status status;
     if (!find(serial, blob, &info, &status, error)) {
@@ -560,6 +631,7 @@ bool DeviceStorage::read(const QString& location, QByteArray* data, QString* err
     auto cached = m_cache.constFind(location);
     if (cached != m_cache.constEnd() && cached->fingerprint == current) {
         *data = cached->data;
+        op.outcome("cached, unchanged on the YubiKey");
         return true;
     }
     StoreKind kind;
@@ -577,6 +649,7 @@ bool DeviceStorage::read(const QString& location, QByteArray* data, QString* err
             return false;
         }
         m_cache.insert(location, {*data, current});
+        op.outcome("read without PIN (legacy store, signature checked)");
         return true;
     }
 
@@ -594,6 +667,9 @@ bool DeviceStorage::read(const QString& location, QByteArray* data, QString* err
         if (!readUnverified(serial, blob, reason, data, error)) {
             return false;
         }
+        op.outcome("read with the checksum only (locked YubiKey, user agreed)");
+    } else {
+        op.outcome(kind == StoreKind::PostQuantum ? "read with the FIDO2 PIN" : "read with the PIN");
     }
     m_cache.insert(location, {*data, current});
     return true;
@@ -606,6 +682,7 @@ bool DeviceStorage::write(const QString& location, const QByteArray& data, QStri
         *error = tr("Not a device location: %1").arg(location);
         return false;
     }
+    OpLog op(this, "write", blob);
     StoreKind kind;
     if (!kindOf(serial, &kind, error)) {
         return false;
@@ -638,6 +715,7 @@ bool DeviceStorage::write(const QString& location, const QByteArray& data, QStri
                                  ? QByteArray::number(info.generation) + ":" + QByteArray::number(info.size)
                                  : QByteArray();
     m_cache.insert(location, {data, fingerprint});
+    op.outcome(QString("written, %1 bytes").arg(data.size()));
     if (wasEncrypted && !m_toldUnencrypted.contains(location) && m_notice) {
         m_toldUnencrypted.insert(location);
         const auto message =
@@ -727,12 +805,14 @@ bool DeviceStorage::readPassword(const QString& location, QString* password, QSt
     }
     password->clear();
     const auto passwd = stem(blob) + ".passwd";
+    OpLog op(this, "read stored password", passwd);
     BlobInfo info;
     Status status;
     if (!find(serial, passwd, &info, &status, error)) {
         if (status == NotFound) {
             // No stored master password: nothing to read.
             error->clear();
+            op.outcome("none");
             return true;
         }
         return false;
@@ -740,6 +820,7 @@ bool DeviceStorage::readPassword(const QString& location, QString* password, QSt
     QString reason;
     if (!passwordUsable(serial, info, &reason)) {
         // Not safe to use: KeePassYB asks for the master password.
+        op.outcome("not used: " + reason);
         return true;
     }
     QByteArray bytes;
@@ -752,6 +833,7 @@ bool DeviceStorage::readPassword(const QString& location, QString* password, QSt
     }
     *password = QString::fromUtf8(bytes);
     bytes.fill('\0');
+    op.outcome("read with the FIDO2 PIN");
     return true;
 }
 
@@ -767,6 +849,7 @@ bool DeviceStorage::removePassword(const QString& location, QString* error)
         return false;
     }
     const auto passwd = stem(blob) + ".passwd";
+    OpLog op(this, "remove stored password", passwd);
     QString detail;
     int tries = -1;
     auto status = m_backend->remove(serial, passwd, pin, &detail, &tries);
@@ -778,6 +861,7 @@ bool DeviceStorage::removePassword(const QString& location, QString* error)
         *error = describe(status, detail, passwd, tries, kind);
         return false;
     }
+    op.outcome("removed");
     return true;
 }
 
@@ -809,6 +893,7 @@ bool DeviceStorage::storePassword(const QString& location, const QString& passwo
         return false;
     }
     const auto passwd = stem(blob) + ".passwd";
+    OpLog op(this, "store password", passwd);
     auto bytes = password.toUtf8();
     QString detail;
     int tries = -1;
@@ -822,6 +907,7 @@ bool DeviceStorage::storePassword(const QString& location, const QString& passwo
         *error = describe(status, detail, passwd, tries, StoreKind::PostQuantum);
         return false;
     }
+    op.outcome("stored, encrypted");
     return true;
 }
 
@@ -844,6 +930,10 @@ void DeviceStorage::setBackend(std::unique_ptr<Backend> backend)
 {
     m_backend = backend ? std::move(backend) : defaultBackend();
     m_backend->touchNotice = [this] {
+        qCInfo(lcYubiKey) << "waiting for a touch";
+        if (m_op) {
+            m_op->touchStarted();
+        }
         if (m_touchNotice) {
             m_touchNotice();
         }
