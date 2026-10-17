@@ -1,0 +1,149 @@
+# Copyright (C) 2026 Frederic Ruget <fred@atlant.is>
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 2 or (at your option) version 3 of the
+# License.
+
+# KeePassYB's CI (yb spec 0046 S6): build and test on Linux, macOS and
+# Windows, with libyubiblob built from yb's source at YB_REV (0.3 or later,
+# for reads without the PIN, yb spec 0044).
+#
+# - Linux: yb's build shell (Nix, contrib/keepassxc/shell.nix), as on a
+#   developer's machine; the tests under a virtual X server.
+# - macOS: Homebrew's Qt and libraries.
+# - Windows: Qt from install-qt-action, the other libraries from vcpkg
+#   (vcpkg.json, cached); yb is built without FIDO2 there (legacy stores
+#   only, yb spec 0043).
+
+name: KeePassYB CI
+
+on:
+  push:
+    branches: [keepassyb]
+  pull_request:
+    branches: [keepassyb]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # yb's commit providing libyubiblob and the build shell; bumped with yb.
+  YB_REV: 664260b371da66fb1345b10a9d4b2c2cd66c614c
+  # The Nix build's Rust, as yb's own CI uses.
+  RUST_TOOLCHAIN: "1.98.1"
+  CARGO_C_VERSION: "0.10.22"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Build and test (yb's build shell)
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/douzebis/yb/$YB_REV/contrib/keepassxc/shell.nix" -o yb-shell.nix
+          nix-shell yb-shell.nix \
+            --arg yb "builtins.fetchTarball \"https://github.com/douzebis/yb/archive/$YB_REV.tar.gz\"" \
+            --run '
+              set -e
+              cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_GUI_TESTS=OFF
+              ninja -C build
+              cd build && xvfb-run -a ctest --output-on-failure -j "$(nproc)"
+              xvfb-run -a ./src/keepassyb --version'
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: douzebis/yb
+          ref: ${{ env.YB_REV }}
+          path: yb
+
+      - name: Install dependencies (Homebrew)
+        run: brew install qt botan minizip qrencode readline libfido2 pkg-config ninja
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Build libyubiblob
+        run: |
+          curl -fsSL -o cargo-c.zip "https://github.com/lu-zero/cargo-c/releases/download/v$CARGO_C_VERSION/cargo-c-macos.zip"
+          unzip -q -o cargo-c.zip -d "$HOME/.cargo/bin"
+          cargo cinstall --locked --release --manifest-path yb/rust/Cargo.toml -p yubiblob \
+            --prefix "$HOME/yubiblob" --libdir lib
+
+      - name: Build and test
+        run: |
+          export PKG_CONFIG_PATH="$HOME/yubiblob/lib/pkgconfig"
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_GUI_TESTS=OFF \
+            -DKPXC_FEATURE_DOCS=OFF -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
+          ninja -C build
+          cd build && QT_QPA_PLATFORM=offscreen ctest --output-on-failure -j "$(sysctl -n hw.ncpu)"
+
+  windows:
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: C:\vcpkg
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: douzebis/yb
+          ref: ${{ env.YB_REV }}
+          path: yb
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: "6.8.3"
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Build libyubiblob
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest "https://github.com/lu-zero/cargo-c/releases/download/v$env:CARGO_C_VERSION/cargo-c-windows-msvc.zip" -OutFile cargo-c.zip
+          Expand-Archive cargo-c.zip -DestinationPath "$env:USERPROFILE\.cargo\bin" -Force
+          cargo cinstall --locked --release --manifest-path yb/rust/Cargo.toml -p yubiblob --prefix C:/yubiblob --libdir lib
+          choco install -y --no-progress pkgconfiglite
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-windows-${{ hashFiles('vcpkg.json') }}
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Build and test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PKG_CONFIG_PATH = 'C:/yubiblob/lib/pkgconfig'
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_GUI_TESTS=OFF `
+            -DKPXC_FEATURE_DOCS=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ninja -C build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:PATH = "C:\yubiblob\bin;$PWD\build\vcpkg_installed\x64-windows\bin;$env:PATH"
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          ctest --test-dir build --output-on-failure -j 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

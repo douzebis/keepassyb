@@ -12,6 +12,9 @@ on:
 
 jobs:
   copilot-setup-steps:
+    # KeePassYB: KeePassXC's own setup, in its repository only (yb spec 0046
+    # S6).
+    if: github.repository == 'keepassxreboot/keepassxc'
     runs-on: ubuntu-latest
 
     # Needed to clone the repository

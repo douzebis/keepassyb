@@ -16,6 +16,7 @@
  */
 
 #include "TestUrlTools.h"
+#include "config-keepassx.h"
 #include <QTest>
 
 QTEST_GUILESS_MAIN(TestUrlTools)
@@ -132,6 +133,11 @@ void TestUrlTools::testIsUrlValid()
 
 void TestUrlTools::testIsUrlValidWithLooseComparison()
 {
+#ifndef KPXC_FEATURE_BROWSER
+    // The top-level domain check of loose comparisons is compiled with
+    // browser integration only (UrlTools.cpp), which KeePassYB leaves off.
+    QSKIP("needs browser integration (KPXC_FEATURE_BROWSER)");
+#endif
     QHash<QString, bool> urls;
     urls[""] = true;
     urls["\"https://github.com/login\""] = true;
