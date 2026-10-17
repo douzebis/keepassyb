@@ -234,18 +234,6 @@ DatabaseWidget::DatabaseWidget(QSharedPointer<Database> db, QWidget* parent)
     m_autosaveTimer->setSingleShot(true);
     connect(m_autosaveTimer, SIGNAL(timeout()), this, SLOT(onAutosaveDelayTimeout()));
 
-    // A database on a device saves a few seconds after the last change, so
-    // that a burst of edits makes one (slow) device write.
-    m_deviceSaveTimer = new QTimer(this);
-    m_deviceSaveTimer->setSingleShot(true);
-    m_deviceSaveTimer->setInterval(DeviceSaveDelayMs);
-    connect(m_deviceSaveTimer, &QTimer::timeout, this, [this] {
-        if (m_db->isModified()) {
-            m_deviceSaveTrigger = QStringLiteral("automatic, after a change");
-            save();
-        }
-    });
-
     m_searchLimitGroup = config()->get(Config::SearchLimitGroup).toBool();
 
     // We need to reregister the database to allow exports
@@ -1862,6 +1850,52 @@ void DatabaseWidget::onGroupChanged()
     emit groupChanged();
 }
 
+/**
+ * A vault on the YubiKey failed to save while locking or closing (yb spec
+ * 0047 S3): offer to retry, to save it to a file, or to discard the
+ * changes, after a second confirmation.  Nothing is lost silently.
+ *
+ * @return true if the vault may now be locked (saved, or changes
+ *         discarded); false to keep it open
+ */
+bool DatabaseWidget::resolveFailedDeviceSave()
+{
+    if (!isOnDevice()) {
+        return false;
+    }
+    while (true) {
+        auto choice =
+            MessageBox::question(this,
+                                 tr("Not saved to the YubiKey"),
+                                 tr("The database could not be saved to the YubiKey (see the message in "
+                                    "the window). Retry, save it to a file, or discard the changes?"),
+                                 MessageBox::Retry | MessageBox::Save | MessageBox::Discard | MessageBox::Cancel,
+                                 MessageBox::Retry);
+        if (choice == MessageBox::Retry) {
+            m_deviceSaveTrigger = QStringLiteral("lock, close or exit (Retry)");
+            if (save()) {
+                return true;
+            }
+        } else if (choice == MessageBox::Save) {
+            // Save As a file (or elsewhere on a YubiKey).
+            if (saveAs()) {
+                return true;
+            }
+        } else if (choice == MessageBox::Discard) {
+            auto sure = MessageBox::question(this,
+                                             tr("Discard changes?"),
+                                             tr("The changes since the last save will be lost. Discard them?"),
+                                             MessageBox::Discard | MessageBox::Cancel,
+                                             MessageBox::Cancel);
+            if (sure == MessageBox::Discard) {
+                return true;
+            }
+        } else {
+            return false;
+        }
+    }
+}
+
 bool DatabaseWidget::isOnDevice() const
 {
     return DeviceStorage::isDeviceLocation(m_db->filePath());
@@ -1872,8 +1906,8 @@ void DatabaseWidget::onDatabaseModified()
     refreshSearch();
     m_remoteSettings->loadSettings();
     if (isOnDevice()) {
-        // Write-through, after the delay; whatever the auto-save settings.
-        m_deviceSaveTimer->start();
+        // Explicit saves only (yb spec 0047 S3): a YubiKey write is slow,
+        // wears the YubiKey, and on a post-quantum store needs a touch.
         return;
     }
     int autosaveDelayMs = m_db->metadata()->autosaveDelayMin() * 60 * 1000; // min to msec for QTimer
@@ -2102,15 +2136,22 @@ bool DatabaseWidget::lock()
                                            .arg(m_db->filePath())
                                            .arg(m_db->isModified())
                                            .arg(m_db->hasNonDataChanges());
+        // A second chance not to write: the content is the same as when it
+        // was read or saved (yb spec 0047 S2).
+        if (m_db->isModified() && m_db->deviceContentUnchanged()) {
+            qCInfo(lcYubiKey).noquote() << QString("lock: %1 marked modified, but its content is unchanged: "
+                                                   "not saved")
+                                               .arg(m_db->filePath());
+            m_db->markAsClean();
+        }
     }
     if (m_db->isModified()) {
         bool saved = false;
         // Attempt to save on exit, but don't block locking if it fails.  A
-        // database on a device saves its pending changes now.
-        if (config()->get(Config::AutoSaveOnExit).toBool() || config()->get(Config::AutoSaveAfterEveryChange).toBool()
-            || isOnDevice()) {
-            m_deviceSaveTimer->stop();
-            m_deviceSaveTrigger = QStringLiteral("lock, close or exit");
+        // database on a device is saved only when asked (yb spec 0047 S3).
+        if (!isOnDevice()
+            && (config()->get(Config::AutoSaveOnExit).toBool()
+                || config()->get(Config::AutoSaveAfterEveryChange).toBool())) {
             saved = save();
 
             if (!saved) {
@@ -2139,7 +2180,10 @@ bool DatabaseWidget::lock()
                                                MessageBox::Save | MessageBox::Discard | MessageBox::Cancel,
                                                MessageBox::Save);
             if (result == MessageBox::Save) {
-                if (!save()) {
+                if (isOnDevice()) {
+                    m_deviceSaveTrigger = QStringLiteral("lock, close or exit (Save changes?)");
+                }
+                if (!save() && !resolveFailedDeviceSave()) {
                     m_attemptingLock = false;
                     return false;
                 }

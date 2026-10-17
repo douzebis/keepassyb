@@ -50,6 +50,7 @@ private slots:
     void testNothingReachesTheYubiKeyWhenQuitting();
     void testOperationsRunOffTheGuiThread();
     void testProgress();
+    void testUnchangedContentIsDetected();
 };
 
 #endif // KEEPASSXC_TESTDEVICESTORAGE_H

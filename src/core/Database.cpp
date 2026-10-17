@@ -28,6 +28,7 @@
 #include "format/KeePass2Writer.h"
 #include "streams/HashingStream.h"
 
+#include <QCryptographicHash>
 #include <QFileInfo>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -195,6 +196,8 @@ bool Database::open(const QString& filePath, QSharedPointer<const CompositeKey> 
     }
 
     KeePass2Reader reader;
+    // Before `key` is moved: a full read, not only the headers.
+    const bool withKey = !key.isNull();
     if (!reader.readDatabase(&dbFile, std::move(key), this)) {
         if (error) {
             *error = tr("Error while reading the database: %1").arg(reader.errorString());
@@ -206,6 +209,9 @@ bool Database::open(const QString& filePath, QSharedPointer<const CompositeKey> 
     dbFile.close();
 
     markAsClean();
+    if (onDevice && withKey) {
+        m_deviceContentHash = contentHash();
+    }
 
     emit databaseOpened();
     if (!onDevice) {
@@ -419,6 +425,7 @@ bool Database::saveToDevice(const QString& location, QString* error)
     if (ok) {
         setFilePath(location);
         markAsClean();
+        m_deviceContentHash = contentHash();
     } else {
         markAsModified();
     }
@@ -590,6 +597,42 @@ bool Database::extract(QByteArray& xmlOutput, QString* error)
     }
 
     return true;
+}
+
+QByteArray Database::contentHash()
+{
+    QByteArray xml;
+    if (!extract(xml)) {
+        return {};
+    }
+    auto text = QString::fromUtf8(xml);
+    xml.fill('\0');
+    // What changes without a data change: the random padding added on each
+    // save and the last-modified stamp of custom data, the view's state
+    // (selected and visible groups, expanded groups), access times and
+    // counts, and modification times (expanding a group stamps it as
+    // modified).  A real change still differs: it changes the data itself.
+    static const QRegularExpression volatileItems(QStringLiteral("<Item>\\s*<Key>(?:%1|%2)</Key>.*?</Item>")
+                                                      .arg(QRegularExpression::escape(CustomData::RandomSlug),
+                                                           QRegularExpression::escape(CustomData::LastModified)),
+                                                  QRegularExpression::DotMatchesEverythingOption);
+    static const QRegularExpression viewState(
+        QStringLiteral("<(LastSelectedGroup|LastTopVisibleGroup|IsExpanded|LastAccessTime|UsageCount|"
+                       "LastModificationTime)\\s*/>"
+                       "|<(LastSelectedGroup|LastTopVisibleGroup|IsExpanded|LastAccessTime|UsageCount|"
+                       "LastModificationTime)>[^<]*</\\2>"));
+    text.remove(volatileItems);
+    text.remove(viewState);
+    auto bytes = text.toUtf8();
+    text.fill(QChar(0));
+    const auto hash = QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
+    bytes.fill('\0');
+    return hash;
+}
+
+bool Database::deviceContentUnchanged()
+{
+    return !m_deviceContentHash.isEmpty() && contentHash() == m_deviceContentHash;
 }
 
 bool Database::import(const QString& xmlExportPath, QString* error)

@@ -347,12 +347,11 @@ private:
 
     // Autosave delay
     QPointer<QTimer> m_autosaveTimer;
-    QPointer<QTimer> m_deviceSaveTimer;
     /// What triggered the next save of a vault on the YubiKey, for its log
     /// (yb spec 0047 S1); empty: Save.
     QString m_deviceSaveTrigger;
-    static constexpr int DeviceSaveDelayMs = 5000;
     bool isOnDevice() const;
+    bool resolveFailedDeviceSave();
     bool chooseSaveLocation(QString* location);
 
     // Auto-Type related

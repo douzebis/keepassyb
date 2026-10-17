@@ -24,6 +24,7 @@
 
 #include "core/Database.h"
 #include "core/DeviceStorage.h"
+#include "core/Group.h"
 #include "core/Metadata.h"
 #include "crypto/Crypto.h"
 #include "crypto/kdf/Kdf.h"
@@ -763,4 +764,31 @@ void TestDeviceStorage::testProgress()
     saveNewDatabase("progress");
     DeviceStorage::instance()->setProgress({});
     QCOMPARE(shown, QStringList({"Saving Passwords.kdbx to the YubiKey…", "Touch your YubiKey…", QString()}));
+}
+
+/// The unchanged-content check (yb spec 0047 S2): a vault marked modified
+/// whose content is the same as when it was read counts as unchanged; the
+/// view's state (an expanded group) does not count; a real change does.
+void TestDeviceStorage::testUnchangedContentIsDetected()
+{
+    saveNewDatabase("content");
+    DeviceStorage::instance()->clearCache();
+    auto db = QSharedPointer<Database>::create();
+    QString error;
+    QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
+    QVERIFY(db->deviceContentUnchanged());
+
+    db->markAsModified();
+    QVERIFY(db->deviceContentUnchanged());
+
+    db->rootGroup()->setExpanded(!db->rootGroup()->isExpanded());
+    db->metadata()->setLastSelectedGroup(db->rootGroup());
+    QVERIFY(db->deviceContentUnchanged());
+
+    db->metadata()->setName("changed");
+    QVERIFY(!db->deviceContentUnchanged());
+
+    // Saved: the new content is the reference.
+    QVERIFY2(db->save(Database::Atomic, {}, &error), qPrintable(error));
+    QVERIFY(db->deviceContentUnchanged());
 }

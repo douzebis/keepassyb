@@ -145,6 +145,11 @@ ApplicationSettingsWidget::ApplicationSettingsWidget(QWidget* parent)
 
     // clang-format off
     connect(m_generalUi->autoSaveAfterEveryChangeCheckBox, SIGNAL(toggled(bool)), SLOT(autoSaveToggled(bool)));
+    // KeePassYB: vaults on a YubiKey are saved only when asked (yb spec 0047
+    // S3).
+    for (auto* autoSave : {m_generalUi->autoSaveAfterEveryChangeCheckBox, m_generalUi->autoSaveOnExitCheckBox}) {
+        autoSave->setText(tr("%1 (not for databases on a YubiKey)").arg(autoSave->text()));
+    }
     connect(m_generalUi->hideWindowOnCopyCheckBox, SIGNAL(toggled(bool)), SLOT(hideWindowOnCopyCheckBoxToggled(bool)));
     connect(m_generalUi->systrayShowCheckBox, SIGNAL(toggled(bool)), SLOT(systrayToggled(bool)));
     connect(m_generalUi->rememberLastDatabasesCheckBox, SIGNAL(toggled(bool)), SLOT(rememberDatabasesToggled(bool)));
