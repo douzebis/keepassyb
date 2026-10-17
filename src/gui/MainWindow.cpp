@@ -1417,6 +1417,9 @@ void MainWindow::closeEvent(QCloseEvent* event)
         return;
     }
 
+    // Vaults on a YubiKey: no more reads while closing (yb spec 0047 S2);
+    // a save asked at exit still writes.
+    DeviceStorage::instance()->setQuitting(true);
     m_appExiting = saveLastDatabases();
     if (m_appExiting) {
         saveWindowInformation();
@@ -1425,6 +1428,7 @@ void MainWindow::closeEvent(QCloseEvent* event)
         return;
     }
 
+    DeviceStorage::instance()->setQuitting(false);
     m_appExitCalled = false;
     m_restartRequested = false;
     event->ignore();

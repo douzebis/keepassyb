@@ -19,6 +19,8 @@
 
 #include "config-keepassx.h"
 
+#include "core/AsyncTask.h"
+
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QThread>
@@ -529,26 +531,62 @@ bool DeviceStorage::pinFor(const QString& serial, StoreKind kind, QByteArray* pi
 
 bool DeviceStorage::kindOf(const QString& serial, StoreKind* kind, QString* error)
 {
+    // Only a reformat changes a store's kind: kept for the whole run.
+    auto known = m_kinds.constFind(serial);
+    if (known != m_kinds.constEnd()) {
+        *kind = *known;
+        return true;
+    }
     QString detail;
+    QElapsedTimer asked;
+    asked.start();
     auto status = m_backend->storeKind(serial, kind, &detail);
+    qCInfo(lcYubiKey).noquote() << QString("store kind: status %1 in %2 ms").arg(status).arg(asked.elapsed());
     if (status != Ok) {
         *error = describe(status, detail, {}, -1, StoreKind::Legacy);
         return false;
     }
+    m_kinds.insert(serial, *kind);
     return true;
+}
+
+bool DeviceStorage::listing(const QString& serial, QList<BlobInfo>* blobs, Status* status, QString* error)
+{
+    // One YubiKey query per user action (yb spec 0047 S2): reused for a few
+    // seconds, dropped after KeePassYB's own writes.
+    auto cached = m_listings.constFind(serial);
+    if (cached != m_listings.constEnd() && cached->age.elapsed() < m_listingLifetimeMs) {
+        *blobs = cached->blobs;
+        *status = Ok;
+        return true;
+    }
+    QString detail;
+    QElapsedTimer listed;
+    listed.start();
+    *status = m_backend->list(serial, blobs, &detail);
+    qCInfo(lcYubiKey).noquote() << QString("list: status %1 in %2 ms").arg(*status).arg(listed.elapsed());
+    if (*status != Ok) {
+        m_listings.remove(serial);
+        m_kinds.remove(serial);
+        *error = describe(*status, detail, {}, -1, StoreKind::Legacy);
+        return false;
+    }
+    Listing fresh;
+    fresh.blobs = *blobs;
+    fresh.age.start();
+    m_listings.insert(serial, fresh);
+    return true;
+}
+
+void DeviceStorage::dropListing(const QString& serial)
+{
+    m_listings.remove(serial);
 }
 
 bool DeviceStorage::find(const QString& serial, const QString& blob, BlobInfo* info, Status* status, QString* error)
 {
     QList<BlobInfo> blobs;
-    QString detail;
-    QElapsedTimer listed;
-    listed.start();
-    *status = m_backend->list(serial, &blobs, &detail);
-    qCInfo(lcYubiKey).noquote()
-        << QString("list (for %1): status %2 in %3 ms").arg(blob).arg(*status).arg(listed.elapsed());
-    if (*status != Ok) {
-        *error = describe(*status, detail, blob, -1, StoreKind::Legacy);
+    if (!listing(serial, &blobs, status, error)) {
         return false;
     }
     for (const auto& b : blobs) {
@@ -614,7 +652,7 @@ bool DeviceStorage::readUnverified(const QString& serial,
     return true;
 }
 
-bool DeviceStorage::read(const QString& location, QByteArray* data, QString* error, bool mayAskPin)
+bool DeviceStorage::readImpl(const QString& location, QByteArray* data, QString* error, bool mayAskPin)
 {
     QString serial, blob;
     if (!parse(location, &serial, &blob)) {
@@ -675,7 +713,7 @@ bool DeviceStorage::read(const QString& location, QByteArray* data, QString* err
     return true;
 }
 
-bool DeviceStorage::write(const QString& location, const QByteArray& data, QString* error)
+bool DeviceStorage::writeImpl(const QString& location, const QByteArray& data, QString* error)
 {
     QString serial, blob;
     if (!parse(location, &serial, &blob)) {
@@ -710,6 +748,7 @@ bool DeviceStorage::write(const QString& location, const QByteArray& data, QStri
         *error = describe(status, detail, blob, tries, kind);
         return false;
     }
+    dropListing(serial);
     BlobInfo info;
     const auto fingerprint = find(serial, blob, &info, &status, &ignored)
                                  ? QByteArray::number(info.generation) + ":" + QByteArray::number(info.size)
@@ -727,16 +766,15 @@ bool DeviceStorage::write(const QString& location, const QByteArray& data, QStri
     return true;
 }
 
-QStringList DeviceStorage::listVaults(const QString& serial, QString* error, Status* status)
+QStringList DeviceStorage::listVaultsImpl(const QString& serial, QString* error, Status* status)
 {
     QList<BlobInfo> blobs;
-    QString detail;
-    auto result = m_backend->list(serial, &blobs, &detail);
+    Status result;
+    const bool listed = listing(serial, &blobs, &result, error);
     if (status) {
         *status = result;
     }
-    if (result != Ok) {
-        *error = describe(result, detail, {}, -1, StoreKind::Legacy);
+    if (!listed) {
         return {};
     }
     QStringList vaults;
@@ -775,7 +813,7 @@ bool DeviceStorage::passwordUsable(const QString& serial, const BlobInfo& passwd
 #endif
 }
 
-bool DeviceStorage::hasStoredPassword(const QString& location)
+bool DeviceStorage::hasStoredPasswordImpl(const QString& location)
 {
     QString serial, blob, error, reason;
     BlobInfo info;
@@ -784,7 +822,7 @@ bool DeviceStorage::hasStoredPassword(const QString& location)
            && passwordUsable(serial, info, &reason);
 }
 
-QString DeviceStorage::ignoredPasswordReason(const QString& location)
+QString DeviceStorage::ignoredPasswordReasonImpl(const QString& location)
 {
     QString serial, blob, error, reason;
     BlobInfo info;
@@ -796,7 +834,7 @@ QString DeviceStorage::ignoredPasswordReason(const QString& location)
     return tr("%1 on this YubiKey is not used: %2.").arg(stem(blob) + ".passwd", reason);
 }
 
-bool DeviceStorage::readPassword(const QString& location, QString* password, QString* error)
+bool DeviceStorage::readPasswordImpl(const QString& location, QString* password, QString* error)
 {
     QString serial, blob;
     if (!parse(location, &serial, &blob)) {
@@ -837,7 +875,7 @@ bool DeviceStorage::readPassword(const QString& location, QString* password, QSt
     return true;
 }
 
-bool DeviceStorage::removePassword(const QString& location, QString* error)
+bool DeviceStorage::removePasswordImpl(const QString& location, QString* error)
 {
     QString serial, blob;
     StoreKind kind;
@@ -854,6 +892,7 @@ bool DeviceStorage::removePassword(const QString& location, QString* error)
     int tries = -1;
     auto status = m_backend->remove(serial, passwd, pin, &detail, &tries);
     pin.fill('\0');
+    dropListing(serial);
     if (status != Ok) {
         if (status == WrongPin || status == PinBlocked || status == Replug || status == FewPinAttempts) {
             forgetPin(serial);
@@ -865,7 +904,7 @@ bool DeviceStorage::removePassword(const QString& location, QString* error)
     return true;
 }
 
-bool DeviceStorage::canRememberPassword(const QString& location)
+bool DeviceStorage::canRememberPasswordImpl(const QString& location)
 {
 #ifdef Q_OS_WIN
     Q_UNUSED(location)
@@ -877,14 +916,14 @@ bool DeviceStorage::canRememberPassword(const QString& location)
 #endif
 }
 
-bool DeviceStorage::storePassword(const QString& location, const QString& password, QString* error)
+bool DeviceStorage::storePasswordImpl(const QString& location, const QString& password, QString* error)
 {
     QString serial, blob;
     if (!parse(location, &serial, &blob)) {
         *error = tr("Not a device location: %1").arg(location);
         return false;
     }
-    if (!canRememberPassword(location)) {
+    if (!canRememberPasswordImpl(location)) {
         *error = tr("The master password is kept only on a YubiKey with a post-quantum store.");
         return false;
     }
@@ -899,6 +938,7 @@ bool DeviceStorage::storePassword(const QString& location, const QString& passwo
     int tries = -1;
     auto status = m_backend->store(serial, passwd, bytes, true, pin, &detail, &tries);
     pin.fill('\0');
+    dropListing(serial);
     bytes.fill('\0');
     if (status != Ok) {
         if (status == WrongPin || status == PinBlocked || status == Replug || status == FewPinAttempts) {
@@ -909,6 +949,113 @@ bool DeviceStorage::storePassword(const QString& location, const QString& passwo
     }
     op.outcome("stored, encrypted");
     return true;
+}
+
+template <typename F> auto DeviceStorage::offGui(F f) -> decltype(f())
+{
+    const auto locked = [&] {
+        QMutexLocker lock(&m_mutex);
+        return f();
+    };
+    auto* app = QCoreApplication::instance();
+    if (app && QThread::currentThread() == app->thread()) {
+        return AsyncTask::runAndWaitForFuture(locked);
+    }
+    return locked();
+}
+
+namespace
+{
+    const char* const kQuitting = "KeePassYB is quitting.";
+}
+
+bool DeviceStorage::read(const QString& location, QByteArray* data, QString* error, bool mayAskPin)
+{
+    if (m_quitting) {
+        *error = tr(kQuitting);
+        return false;
+    }
+    return offGui([&] { return readImpl(location, data, error, mayAskPin); });
+}
+
+bool DeviceStorage::write(const QString& location, const QByteArray& data, QString* error)
+{
+    return offGui([&] { return writeImpl(location, data, error); });
+}
+
+QStringList DeviceStorage::listVaults(const QString& serial, QString* error, Status* status)
+{
+    if (m_quitting) {
+        *error = tr(kQuitting);
+        if (status) {
+            *status = NotAvailable;
+        }
+        return {};
+    }
+    return offGui([&] { return listVaultsImpl(serial, error, status); });
+}
+
+bool DeviceStorage::readPassword(const QString& location, QString* password, QString* error)
+{
+    password->clear();
+    if (m_quitting) {
+        return true;
+    }
+    return offGui([&] { return readPasswordImpl(location, password, error); });
+}
+
+bool DeviceStorage::hasStoredPassword(const QString& location)
+{
+    return !m_quitting && offGui([&] { return hasStoredPasswordImpl(location); });
+}
+
+QString DeviceStorage::ignoredPasswordReason(const QString& location)
+{
+    return m_quitting ? QString() : offGui([&] { return ignoredPasswordReasonImpl(location); });
+}
+
+DeviceStorage::PasswordStatus DeviceStorage::passwordStatus(const QString& location)
+{
+    if (m_quitting) {
+        return {};
+    }
+    // Every question answered from one listing, and the store kind kept
+    // for the run.
+    return offGui([&] {
+        PasswordStatus status;
+        status.used = hasStoredPasswordImpl(location);
+        if (!status.used) {
+            status.ignoredReason = ignoredPasswordReasonImpl(location);
+            status.canRemember = canRememberPasswordImpl(location);
+        }
+        return status;
+    });
+}
+
+bool DeviceStorage::removePassword(const QString& location, QString* error)
+{
+    return offGui([&] { return removePasswordImpl(location, error); });
+}
+
+bool DeviceStorage::canRememberPassword(const QString& location)
+{
+    return !m_quitting && offGui([&] { return canRememberPasswordImpl(location); });
+}
+
+bool DeviceStorage::storePassword(const QString& location, const QString& password, QString* error)
+{
+    return offGui([&] { return storePasswordImpl(location, password, error); });
+}
+
+void DeviceStorage::setQuitting(bool quitting)
+{
+    qCInfo(lcYubiKey) << (quitting ? "quitting: no more reads" : "not quitting after all");
+    m_quitting = quitting;
+}
+
+void DeviceStorage::setListingLifetime(int ms)
+{
+    m_listingLifetimeMs = ms;
 }
 
 void DeviceStorage::setPin(const QString& serial, const QString& pin)
@@ -929,6 +1076,8 @@ void DeviceStorage::forgetPin(const QString& serial)
 void DeviceStorage::setBackend(std::unique_ptr<Backend> backend)
 {
     m_backend = backend ? std::move(backend) : defaultBackend();
+    m_listings.clear();
+    m_kinds.clear();
     m_backend->touchNotice = [this] {
         qCInfo(lcYubiKey) << "waiting for a touch";
         if (m_op) {
@@ -964,4 +1113,6 @@ void DeviceStorage::clearCache()
 {
     m_cache.clear();
     m_toldUnencrypted.clear();
+    m_listings.clear();
+    m_kinds.clear();
 }

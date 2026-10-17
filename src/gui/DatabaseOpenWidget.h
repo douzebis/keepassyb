@@ -86,7 +86,7 @@ private slots:
     void hardwareKeyResponse(bool found);
 
 private:
-    void offerToDeleteIgnoredPassword();
+    void offerToDeleteIgnoredPassword(const QString& reason);
 
     QPointer<DeviceListener> m_deviceListener;
     /// Vaults on a post-quantum YubiKey store: keep the master password

@@ -19,9 +19,11 @@
 #define KEEPASSXC_DEVICESTORAGE_H
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QList>
 #include <QLoggingCategory>
+#include <QRecursiveMutex>
 #include <QSet>
 #include <QString>
 #include <QStringList>
@@ -194,6 +196,19 @@ public:
     /// Why the YubiKey's `<vault>.passwd` is not used (stored unencrypted,
     /// or in a legacy store); empty if there is none, or it is used.
     QString ignoredPasswordReason(const QString& location);
+
+    /// What the unlock dialog needs about a vault's stored master password,
+    /// from one YubiKey query (yb spec 0047 S2).
+    struct PasswordStatus
+    {
+        /// A usable `<vault>.passwd` is stored.
+        bool used = false;
+        /// Why a stored one is not used; empty if none, or used.
+        QString ignoredReason;
+        /// One may be stored (post-quantum store, not on Windows yet).
+        bool canRemember = false;
+    };
+    PasswordStatus passwordStatus(const QString& location);
     /// Delete the vault's `<vault>.passwd` (with the PIN).
     bool removePassword(const QString& location, QString* error);
     /// Whether the vault's master password may be kept on its YubiKey:
@@ -213,6 +228,11 @@ public:
     void setUnverifiedReadPrompt(UnverifiedReadPrompt prompt);
     void setNotice(Notice notice);
     void setTouchNotice(TouchNotice notice);
+    /// KeePassYB is quitting: reads and status questions no longer reach
+    /// the YubiKey (writes still do, for a save asked at exit).
+    void setQuitting(bool quitting);
+    /// How long a YubiKey listing is reused, in ms (tests).
+    void setListingLifetime(int ms);
     /// Drop cached bytes (tests).
     void clearCache();
 
@@ -229,6 +249,21 @@ private:
 
     bool pinFor(const QString& serial, StoreKind kind, QByteArray* pin, QString* error);
     bool kindOf(const QString& serial, StoreKind* kind, QString* error);
+    bool listing(const QString& serial, QList<BlobInfo>* blobs, Status* status, QString* error);
+    void dropListing(const QString& serial);
+    /// Run `f` off the GUI thread (the GUI keeps processing events), one
+    /// operation at a time (yb spec 0047 S2).
+    template <typename F> auto offGui(F f) -> decltype(f());
+
+    bool readImpl(const QString& location, QByteArray* data, QString* error, bool mayAskPin);
+    bool writeImpl(const QString& location, const QByteArray& data, QString* error);
+    QStringList listVaultsImpl(const QString& serial, QString* error, Status* status);
+    bool readPasswordImpl(const QString& location, QString* password, QString* error);
+    bool hasStoredPasswordImpl(const QString& location);
+    QString ignoredPasswordReasonImpl(const QString& location);
+    bool removePasswordImpl(const QString& location, QString* error);
+    bool canRememberPasswordImpl(const QString& location);
+    bool storePasswordImpl(const QString& location, const QString& password, QString* error);
     bool find(const QString& serial, const QString& blob, BlobInfo* info, Status* status, QString* error);
     bool
     fetch(const QString& serial, const QString& blob, StoreKind kind, QByteArray* data, QString* error, Status* status);
@@ -250,6 +285,18 @@ private:
     TouchNotice m_touchNotice;
     /// Locations already told they are now stored unencrypted.
     QSet<QString> m_toldUnencrypted;
+
+    struct Listing
+    {
+        QList<BlobInfo> blobs;
+        QElapsedTimer age;
+    };
+    QHash<QString, Listing> m_listings;
+    QHash<QString, StoreKind> m_kinds;
+    int m_listingLifetimeMs = 3000;
+    bool m_quitting = false;
+    /// One operation at a time; recursive, as operations call each other.
+    QRecursiveMutex m_mutex;
     QHash<QString, QByteArray> m_pins;
     QHash<QString, CacheEntry> m_cache;
 };

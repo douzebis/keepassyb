@@ -45,6 +45,10 @@ private slots:
     void testLockedYubiKeyFallback();
     void testLegacyVaultOpensWithLockedYubiKey();
     void testRememberPassword();
+    void testOneListingPerAction();
+    void testListingIsDroppedAfterAWriteAndExpires();
+    void testNothingReachesTheYubiKeyWhenQuitting();
+    void testOperationsRunOffTheGuiThread();
 };
 
 #endif // KEEPASSXC_TESTDEVICESTORAGE_H

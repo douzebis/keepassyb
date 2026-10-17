@@ -17,8 +17,10 @@
 
 #include "TestDeviceStorage.h"
 
+#include <QCoreApplication>
 #include <QSet>
 #include <QTest>
+#include <QThread>
 
 #include "core/Database.h"
 #include "core/DeviceStorage.h"
@@ -48,6 +50,10 @@ namespace
         int unverifiedFetches = 0;
         int stores = 0;
         int touches = 0;
+        int lists = 0;
+        int kinds = 0;
+        /// Whether a backend call ran on the GUI (main) thread.
+        bool calledOnMainThread = false;
         int pinTries = 3;
         bool full = false;
     };
@@ -64,6 +70,8 @@ namespace
     public:
         DeviceStorage::Status list(const QString&, QList<DeviceStorage::BlobInfo>* blobs, QString*) override
         {
+            ++fake->lists;
+            noteThread();
             blobs->clear();
             for (auto it = fake->blobs.constBegin(); it != fake->blobs.constEnd(); ++it) {
                 blobs->append({it.key(),
@@ -77,6 +85,8 @@ namespace
 
         DeviceStorage::Status storeKind(const QString&, DeviceStorage::StoreKind* kind, QString*) override
         {
+            ++fake->kinds;
+            noteThread();
             *kind = fake->kind;
             return DeviceStorage::Ok;
         }
@@ -154,6 +164,13 @@ namespace
         }
 
     private:
+        static void noteThread()
+        {
+            if (QThread::currentThread() == QCoreApplication::instance()->thread()) {
+                fake->calledOnMainThread = true;
+            }
+        }
+
         DeviceStorage::Status withPin(const QByteArray& pin, QString* error, int* pinTries)
         {
             if (fake->locked != DeviceStorage::Ok) {
@@ -208,6 +225,10 @@ void TestDeviceStorage::init()
     storage->setNotice({});
     storage->setTouchNotice({});
     storage->clearCache();
+    // Every test sees the fake YubiKey as it is now; the reuse of listings
+    // has its own tests.
+    storage->setListingLifetime(0);
+    storage->setQuitting(false);
     storage->forgetPin("");
 }
 
@@ -381,6 +402,7 @@ void TestDeviceStorage::testHeaderReadDoesNotAskForThePin()
     QCOMPARE(fake->fetches, 0);
 
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
+    DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     DeviceStorage::instance()->clearCache();
     QVERIFY(!QSharedPointer<Database>::create()->open(Location, nullptr, &error));
     QCOMPARE(prompts, 0);
@@ -406,6 +428,7 @@ void TestDeviceStorage::testWrongPin()
 {
     saveNewDatabase("pin");
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
+    DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     DeviceStorage::instance()->clearCache();
     DeviceStorage::instance()->forgetPin("");
     QStringList answers{"000000", Pin};
@@ -446,6 +469,7 @@ void TestDeviceStorage::testStoredMasterPassword()
 
     // Encrypted, in a post-quantum store: used.
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
+    DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     fake->blobs.insert("Passwords.passwd", "correct horse\n");
     fake->encrypted.insert("Passwords.passwd");
 #ifndef Q_OS_WIN
@@ -464,6 +488,7 @@ void TestDeviceStorage::testStoredMasterPassword()
 
     // In a legacy store: classical encryption.
     fake->kind = DeviceStorage::StoreKind::Legacy;
+    DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     fake->encrypted.insert("Passwords.passwd");
     QVERIFY(!storage->hasStoredPassword(Location));
     QVERIFY(storage->readPassword(Location, &password, &error));
@@ -507,6 +532,7 @@ void TestDeviceStorage::testEncryptedVaultIsRewrittenUnencrypted()
 void TestDeviceStorage::testPostQuantumAsksFido2PinAndTouch()
 {
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
+    DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     QList<DeviceStorage::StoreKind> asked;
     DeviceStorage::instance()->setPinPrompt([&asked](const QString&, DeviceStorage::StoreKind kind) {
         asked << kind;
@@ -544,6 +570,7 @@ void TestDeviceStorage::testLockedYubiKeyFallback()
     const auto original = fake->blobs.value("Passwords.kdbx");
     setVersion(1, 4);
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
+    DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     fake->locked = DeviceStorage::PinBlocked;
     DeviceStorage::instance()->clearCache();
     int prompts = 0;
@@ -606,6 +633,7 @@ void TestDeviceStorage::testRememberPassword()
     QVERIFY(!fake->blobs.contains("Passwords.passwd"));
 
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
+    DeviceStorage::instance()->clearCache(); // a reformat, for the caches
 #ifdef Q_OS_WIN
     QVERIFY(!storage->canRememberPassword(Location));
 #else
@@ -617,4 +645,95 @@ void TestDeviceStorage::testRememberPassword()
     QVERIFY(storage->readPassword(Location, &password, &error));
     QCOMPARE(password, QString("secret"));
 #endif
+}
+
+/// The unlock dialog's questions and a header read cost one listing and
+/// one store-kind query (yb spec 0047 S2).
+void TestDeviceStorage::testOneListingPerAction()
+{
+    saveNewDatabase("one listing");
+    fake->kind = DeviceStorage::StoreKind::PostQuantum;
+    fake->blobs.insert("Passwords.passwd", "secret");
+    auto* storage = DeviceStorage::instance();
+    storage->clearCache();
+    storage->setListingLifetime(60000);
+    // As after a lock: the PIN is forgotten before the locked view loads.
+    storage->forgetPin("");
+    fake->lists = 0;
+    fake->kinds = 0;
+
+    QString error;
+    QSharedPointer<Database>::create()->open(Location, nullptr, &error);
+    const auto status = storage->passwordStatus(Location);
+    QVERIFY(!status.used);
+    QVERIFY(!status.ignoredReason.isEmpty());
+    QVERIFY(storage->hasStoredPassword(Location) == status.used);
+    QCOMPARE(fake->lists, 1);
+    QCOMPARE(fake->kinds, 1);
+    QCOMPARE(fake->fetches + fake->unverifiedFetches, 0);
+}
+
+/// KeePassYB's own write drops the listing; it also expires.
+void TestDeviceStorage::testListingIsDroppedAfterAWriteAndExpires()
+{
+    auto* storage = DeviceStorage::instance();
+    storage->setListingLifetime(60000);
+    saveNewDatabase("first");
+    QString error;
+    storage->listVaults({}, &error);
+    const auto lists = fake->lists;
+    storage->listVaults({}, &error);
+    QCOMPARE(fake->lists, lists);
+
+    // A write: the next question lists again, and sees it.
+    saveNewDatabase("second");
+    fake->lists = 0;
+    storage->listVaults({}, &error);
+    QCOMPARE(fake->lists, 0); // the write's own fresh listing is reused
+
+    // Changed elsewhere: seen once the listing expires.
+    fake->blobs.insert("Other.kdbx", "x");
+    QVERIFY(!storage->listVaults({}, &error).contains("Other.kdbx"));
+    storage->setListingLifetime(0);
+    QVERIFY(storage->listVaults({}, &error).contains("Other.kdbx"));
+}
+
+/// While quitting, reads and questions do not reach the YubiKey; a write
+/// still does.
+void TestDeviceStorage::testNothingReachesTheYubiKeyWhenQuitting()
+{
+    saveNewDatabase("quit");
+    auto* storage = DeviceStorage::instance();
+    storage->clearCache();
+    storage->setQuitting(true);
+    fake->lists = 0;
+    fake->kinds = 0;
+
+    QByteArray data;
+    QString error;
+    QVERIFY(!storage->read(Location, &data, &error));
+    QVERIFY(storage->listVaults({}, &error).isEmpty());
+    QVERIFY(!storage->passwordStatus(Location).used);
+    QString password;
+    QVERIFY(storage->readPassword(Location, &password, &error));
+    QCOMPARE(fake->lists + fake->kinds, 0);
+
+    const auto stores = fake->stores;
+    QVERIFY2(storage->write(Location, "bytes", &error), qPrintable(error));
+    QCOMPARE(fake->stores, stores + 1);
+}
+
+/// Called from the GUI (main) thread, the YubiKey is reached from a worker
+/// thread: the GUI keeps processing events.
+void TestDeviceStorage::testOperationsRunOffTheGuiThread()
+{
+    saveNewDatabase("threads");
+    DeviceStorage::instance()->clearCache();
+    fake->calledOnMainThread = false;
+    auto db = QSharedPointer<Database>::create();
+    QString error;
+    QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
+    DeviceStorage::instance()->passwordStatus(Location);
+    DeviceStorage::instance()->listVaults({}, &error);
+    QVERIFY(!fake->calledOnMainThread);
 }

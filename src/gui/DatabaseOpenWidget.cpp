@@ -262,14 +262,15 @@ void DatabaseOpenWidget::load(const QString& filename)
     m_rememberPassword->setChecked(false);
     m_rememberPassword->setVisible(false);
     if (DeviceStorage::isDeviceLocation(m_filename)) {
-        auto* storage = DeviceStorage::instance();
-        if (storage->hasStoredPassword(m_filename)) {
+        // One YubiKey query for all of it (yb spec 0047 S2).
+        const auto status = DeviceStorage::instance()->passwordStatus(m_filename);
+        if (status.used) {
             m_ui->messageWidget->showMessage(
                 tr("The master password is stored on the YubiKey: leave the password empty and click Unlock."),
                 MessageWidget::Information);
         } else {
-            m_rememberPassword->setVisible(storage->canRememberPassword(m_filename));
-            offerToDeleteIgnoredPassword();
+            m_rememberPassword->setVisible(status.canRemember);
+            offerToDeleteIgnoredPassword(status.ignoredReason);
         }
     }
 
@@ -354,11 +355,10 @@ void DatabaseOpenWidget::enterKey(const QString& pw, const QString& keyFile)
  * a legacy store): say why, and offer to delete it, once per vault and
  * session (KeePassYB).
  */
-void DatabaseOpenWidget::offerToDeleteIgnoredPassword()
+void DatabaseOpenWidget::offerToDeleteIgnoredPassword(const QString& reason)
 {
     static QSet<QString> asked;
     auto* storage = DeviceStorage::instance();
-    const auto reason = storage->ignoredPasswordReason(m_filename);
     if (reason.isEmpty() || asked.contains(m_filename)) {
         return;
     }
