@@ -88,7 +88,9 @@ jobs:
           cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_GUI_TESTS=OFF \
             -DKPXC_FEATURE_DOCS=OFF -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
           ninja -C build
-          cd build && QT_QPA_PLATFORM=offscreen ctest --output-on-failure -j "$(sysctl -n hw.ncpu)"
+          # The runner has a desktop session: no offscreen platform (it has no
+          # clipboard, which the CLI's clip test needs).
+          cd build && ctest --output-on-failure -j "$(sysctl -n hw.ncpu)" || { ctest --rerun-failed -V; exit 1; }
 
   windows:
     runs-on: windows-latest
@@ -144,6 +146,10 @@ jobs:
           ninja -C build
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:PATH = "C:\yubiblob\bin;$PWD\build\vcpkg_installed\x64-windows\bin;$env:PATH"
-          $env:QT_QPA_PLATFORM = 'offscreen'
+          # The runner has a desktop session: no offscreen platform (it has no
+          # clipboard, which the CLI's clip test needs).
           ctest --test-dir build --output-on-failure -j 4
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE) {
+            ctest --test-dir build --rerun-failed -V
+            exit 1
+          }

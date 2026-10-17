@@ -85,9 +85,9 @@ if(APPLE AND WITH_APP_BUNDLE)
 
     add_custom_command(TARGET keepassxc-cli
             POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_BINARY_DIR}/keepassxc-cli ${CLI_APP_DIR}/keepassxc-cli
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:keepassxc-cli> ${CLI_APP_DIR}/keepassyb-cli
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/src
-            COMMENT "Copying keepassxc-cli into app bundle")
+            COMMENT "Copying keepassyb-cli into app bundle")
     set_property(GLOBAL APPEND PROPERTY
-        _MACDEPLOYQT_EXTRA_BINARIES "${CLI_INSTALL_DIR}/keepassxc-cli")
+        _MACDEPLOYQT_EXTRA_BINARIES "${CLI_INSTALL_DIR}/keepassyb-cli")
 endif()
