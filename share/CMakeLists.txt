@@ -59,13 +59,22 @@ if(UNIX AND NOT APPLE AND NOT HAIKU)
     endif(KEEPASSXC_DIST_FLATPAK)
     # The desktop entry names the installed program by its full path, so that
     # it starts even when the install prefix is not in the session's PATH;
-    # AppImage, Flatpak and Snap launch it by name (yb spec 0047 S6).
+    # AppImage, Flatpak and Snap launch it by name (yb spec 0047 S6).  The
+    # path is written at install time, as "cmake --install --prefix" may
+    # change the prefix after configuring.
     if(KEEPASSXC_DIST_APPIMAGE OR KEEPASSXC_DIST_FLATPAK OR KEEPASSXC_DIST_SNAP)
         set(APP_EXEC "keepassyb")
     else()
-        set(APP_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/keepassyb")
+        set(APP_EXEC "@KEEPASSYB_EXEC@")
     endif()
-    configure_file(linux/${APP_ID}.desktop.in ${CMAKE_CURRENT_BINARY_DIR}/linux/${APP_ID}.desktop @ONLY)
+    configure_file(linux/${APP_ID}.desktop.in ${CMAKE_CURRENT_BINARY_DIR}/linux/${APP_ID}.desktop.in @ONLY)
+    install(CODE "
+        set(KEEPASSYB_EXEC \"${CMAKE_INSTALL_BINDIR}/keepassyb\")
+        if(NOT IS_ABSOLUTE \"\${KEEPASSYB_EXEC}\")
+            set(KEEPASSYB_EXEC \"\${CMAKE_INSTALL_PREFIX}/\${KEEPASSYB_EXEC}\")
+        endif()
+        configure_file(\"${CMAKE_CURRENT_BINARY_DIR}/linux/${APP_ID}.desktop.in\"
+                       \"${CMAKE_CURRENT_BINARY_DIR}/linux/${APP_ID}.desktop\" @ONLY)")
     configure_file(linux/${APP_ID}.policy.in ${CMAKE_CURRENT_BINARY_DIR}/linux/${APP_ID}.policy @ONLY)
 
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/linux/${APP_ID}.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
