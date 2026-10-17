@@ -622,6 +622,12 @@ void DatabaseOpenWidget::pollHardwareKey(bool manualTrigger, int delay)
     if (m_pollingHardwareKey) {
         return;
     }
+    // A vault on a YubiKey: no automatic scan for challenge-response keys,
+    // which would reach the same, slow YubiKey; the refresh button still
+    // scans (yb spec 0047 S5).
+    if (!manualTrigger && DeviceStorage::isDeviceLocation(m_filename)) {
+        return;
+    }
 
     m_ui->hardwareKeyCombo->setEnabled(false);
     m_ui->useHardwareKeyCheckBox->setEnabled(false);

@@ -51,12 +51,20 @@ if(UNIX AND NOT APPLE AND NOT HAIKU)
         install(FILES ${CMAKE_CURRENT_BINARY_DIR}/linux/keepassyb.xml DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages)
 
         install(DIRECTORY icons/application/ DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor
-                FILES_MATCHING PATTERN "keepassx*.png" PATTERN "keepassx*.svg"
+                FILES_MATCHING PATTERN "keepassyb*.png" PATTERN "keepassyb*.svg"
                 PATTERN "status" EXCLUDE PATTERN "actions" EXCLUDE PATTERN "categories" EXCLUDE)
         install(DIRECTORY icons/application/ DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor
                 FILES_MATCHING PATTERN "application-x-keepassyb.svg" PATTERN "status"
                 EXCLUDE PATTERN "actions" EXCLUDE PATTERN "categories" EXCLUDE)
     endif(KEEPASSXC_DIST_FLATPAK)
+    # The desktop entry names the installed program by its full path, so that
+    # it starts even when the install prefix is not in the session's PATH;
+    # AppImage, Flatpak and Snap launch it by name (yb spec 0047 S6).
+    if(KEEPASSXC_DIST_APPIMAGE OR KEEPASSXC_DIST_FLATPAK OR KEEPASSXC_DIST_SNAP)
+        set(APP_EXEC "keepassyb")
+    else()
+        set(APP_EXEC "${CMAKE_INSTALL_FULL_BINDIR}/keepassyb")
+    endif()
     configure_file(linux/${APP_ID}.desktop.in ${CMAKE_CURRENT_BINARY_DIR}/linux/${APP_ID}.desktop @ONLY)
     configure_file(linux/${APP_ID}.policy.in ${CMAKE_CURRENT_BINARY_DIR}/linux/${APP_ID}.policy @ONLY)
 
