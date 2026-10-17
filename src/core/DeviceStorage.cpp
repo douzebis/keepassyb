@@ -691,6 +691,28 @@ bool DeviceStorage::readImpl(const QString& location, QByteArray* data, QString*
         return true;
     }
 
+    // A KDBX 4 vault of a post-quantum store needs no PIN either (yb spec
+    // 0047 S4): it is read with its checksum only, as KDBX 4 checks its own
+    // integrity (an HMAC per block, keyed by the master password).  A KDBX
+    // 3.1 vault, whose own check is weaker, keeps the YubiKey's full check.
+    if (!info.encrypted && kind == StoreKind::PostQuantum) {
+        QByteArray bytes;
+        QString detail;
+        status = m_backend->fetchUnencrypted(serial, blob, &bytes, &detail);
+        if (status != Ok) {
+            *error = describe(status, detail, blob, -1, kind);
+            return false;
+        }
+        if (!isBeforeKdbx4(bytes)) {
+            *data = bytes;
+            m_cache.insert(location, {*data, current});
+            op.outcome("read without PIN (checksum only, KDBX 4)");
+            return true;
+        }
+        bytes.fill('\0');
+        qCInfo(lcYubiKey).noquote() << QString("%1 is KDBX 3.1: read again with the full check").arg(blob);
+    }
+
     if (!mayAskPin && !m_pins.contains(serial)) {
         *error = tr("%1 is read from the YubiKey when unlocking.").arg(blob);
         return false;

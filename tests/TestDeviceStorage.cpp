@@ -26,6 +26,8 @@
 #include "core/DeviceStorage.h"
 #include "core/Metadata.h"
 #include "crypto/Crypto.h"
+#include "crypto/kdf/Kdf.h"
+#include "format/KeePass2.h"
 #include "keys/PasswordKey.h"
 
 QTEST_GUILESS_MAIN(TestDeviceStorage)
@@ -198,10 +200,15 @@ namespace
         return k;
     }
 
-    /// A new database saved to the fake YubiKey.
+    /// A new database saved to the fake YubiKey, as KDBX 4 (Argon2, made
+    /// fast for tests), the format of real vaults.
     void saveNewDatabase(const QString& name)
     {
         auto db = QSharedPointer<Database>::create();
+        auto kdf = KeePass2::uuidToKdf(KeePass2::KDF_ARGON2D);
+        kdf->setRounds(1);
+        kdf->processParameters({{KeePass2::KDFPARAM_ARGON2_MEMORY, 1024}, {KeePass2::KDFPARAM_ARGON2_PARALLELISM, 1}});
+        db->changeKdf(kdf);
         db->setKey(key());
         db->metadata()->setName(name);
         QString error;
@@ -401,16 +408,16 @@ void TestDeviceStorage::testHeaderReadDoesNotAskForThePin()
     QCOMPARE(prompts, 0);
     QCOMPARE(fake->fetches, 0);
 
+    // Post-quantum, KDBX 4: read with the checksum only, no PIN either.
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
-    DeviceStorage::instance()->clearCache();
-    QVERIFY(!QSharedPointer<Database>::create()->open(Location, nullptr, &error));
+    QSharedPointer<Database>::create()->open(Location, nullptr, &error);
     QCOMPARE(prompts, 0);
     QCOMPARE(fake->fetches, 0);
 
     auto db = QSharedPointer<Database>::create();
     QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
-    QCOMPARE(prompts, 1);
+    QCOMPARE(prompts, 0);
 }
 
 /// A vault that is not on the YubiKey: opening fails, saying so.
@@ -423,10 +430,12 @@ void TestDeviceStorage::testMissingVault()
 }
 
 /// A wrong PIN fails with the tries left, and is forgotten: the next
-/// operation asks again.  (A post-quantum store: reading needs its PIN.)
+/// operation asks again.  (A post-quantum store and a vault stored
+/// encrypted by an older version: reading it needs the PIN.)
 void TestDeviceStorage::testWrongPin()
 {
     saveNewDatabase("pin");
+    fake->encrypted.insert("Passwords.kdbx");
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     DeviceStorage::instance()->clearCache();
@@ -527,8 +536,9 @@ void TestDeviceStorage::testEncryptedVaultIsRewrittenUnencrypted()
     QCOMPARE(notices.size(), 1);
 }
 
-/// A post-quantum store: the FIDO2 PIN is asked (named so), and each read
-/// or save asks for a touch, which the user is told about.
+/// A post-quantum store: a KDBX 4 vault opens with no PIN and no touch
+/// (yb spec 0047 S4); saving asks for the FIDO2 PIN (named so) and one
+/// touch, which the user is told about.
 void TestDeviceStorage::testPostQuantumAsksFido2PinAndTouch()
 {
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
@@ -541,19 +551,26 @@ void TestDeviceStorage::testPostQuantumAsksFido2PinAndTouch()
     int notices = 0;
     DeviceStorage::instance()->setTouchNotice([&notices] { ++notices; });
     saveNewDatabase("pq");
+    QCOMPARE(asked, QList<DeviceStorage::StoreKind>{DeviceStorage::StoreKind::PostQuantum});
+    QCOMPARE(fake->touches, 1);
+    QCOMPARE(notices, 1);
+
     DeviceStorage::instance()->clearCache();
+    DeviceStorage::instance()->forgetPin("");
     auto db = QSharedPointer<Database>::create();
     QString error;
     QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
-    QCOMPARE(asked, QList<DeviceStorage::StoreKind>{DeviceStorage::StoreKind::PostQuantum});
-    QCOMPARE(fake->touches, 2);
-    QCOMPARE(notices, 2);
-    QCOMPARE(fake->unverifiedFetches, 0);
+    QCOMPARE(db->metadata()->name(), QString("pq"));
+    QCOMPARE(asked.size(), 1);
+    QCOMPARE(fake->touches, 1);
+    QCOMPARE(fake->fetches, 0);
+    QCOMPARE(fake->unverifiedFetches, 1);
 }
 
-/// A locked YubiKey (post-quantum store): the vault is read without the
-/// YubiKey's check only if the user agrees; the prompt says whether the
-/// vault is KDBX 3.1 (yb spec 0044, KeePassYB spec S2).
+/// A locked YubiKey (post-quantum store).  A KDBX 4 vault opens anyway,
+/// with no PIN and no question (yb spec 0047 S4).  A KDBX 3.1 vault needs
+/// the full check, so it is read without it only if the user agrees, the
+/// prompt being told it is KDBX 3.1 (yb spec 0044, 0046 S2).
 void TestDeviceStorage::testLockedYubiKeyFallback()
 {
     saveNewDatabase("locked");
@@ -567,14 +584,11 @@ void TestDeviceStorage::testLockedYubiKeyFallback()
         fake->blobs.insert("Passwords.kdbx", bytes);
         fake->generations.insert("Passwords.kdbx", fake->nextGeneration++);
     };
-    const auto original = fake->blobs.value("Passwords.kdbx");
-    setVersion(1, 4);
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     fake->locked = DeviceStorage::PinBlocked;
-    DeviceStorage::instance()->clearCache();
     int prompts = 0;
-    bool sawKdbx3 = true;
+    bool sawKdbx3 = false;
     bool agree = false;
     DeviceStorage::instance()->setUnverifiedReadPrompt([&](const QString& blob, const QString& reason, bool kdbx3) {
         ++prompts;
@@ -582,31 +596,29 @@ void TestDeviceStorage::testLockedYubiKeyFallback()
         return agree && blob == "Passwords.kdbx" && reason.contains("FIDO2 PIN is blocked");
     });
 
+    // KDBX 4: opens, no question.
+    setVersion(1, 4);
     QByteArray data;
     QString error;
+    QVERIFY2(DeviceStorage::instance()->read(Location, &data, &error), qPrintable(error));
+    QCOMPARE(prompts, 0);
+
+    // KDBX 3.1: the full check fails on the locked YubiKey; the prompt.
+    setVersion(1, 3);
     QVERIFY(!DeviceStorage::instance()->read(Location, &data, &error));
     QVERIFY2(error.contains("FIDO2 PIN is blocked"), qPrintable(error));
     QCOMPARE(prompts, 1);
-    QVERIFY(!sawKdbx3);
-
+    QVERIFY(sawKdbx3);
     agree = true;
-    fake->blobs.insert("Passwords.kdbx", original);
     fake->generations.insert("Passwords.kdbx", fake->nextGeneration++);
-    auto db = QSharedPointer<Database>::create();
-    QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
-    QCOMPARE(db->metadata()->name(), QString("locked"));
+    QVERIFY2(DeviceStorage::instance()->read(Location, &data, &error), qPrintable(error));
     QCOMPARE(prompts, 2);
 
-    // A KDBX 3.1 header: the prompt is told, for its stronger warning.
-    setVersion(1, 3);
-    QVERIFY(DeviceStorage::instance()->read(Location, &data, &error));
-    QVERIFY(sawKdbx3);
-
-    // An encrypted vault cannot be read so.
+    // An encrypted vault cannot be read without the PIN.
     fake->encrypted.insert("Passwords.kdbx");
     fake->generations.insert("Passwords.kdbx", fake->nextGeneration++);
     QVERIFY(!DeviceStorage::instance()->read(Location, &data, &error));
-    QCOMPARE(prompts, 3);
+    QCOMPARE(prompts, 2);
 }
 
 /// A legacy store's vault opens without the PIN even when the PIN is
@@ -670,7 +682,9 @@ void TestDeviceStorage::testOneListingPerAction()
     QVERIFY(storage->hasStoredPassword(Location) == status.used);
     QCOMPARE(fake->lists, 1);
     QCOMPARE(fake->kinds, 1);
-    QCOMPARE(fake->fetches + fake->unverifiedFetches, 0);
+    // The header read of a KDBX 4 vault reads it without the PIN (S4).
+    QCOMPARE(fake->fetches, 0);
+    QCOMPARE(fake->unverifiedFetches, 1);
 }
 
 /// KeePassYB's own write drops the listing; it also expires.
