@@ -36,6 +36,7 @@ namespace Ui
 }
 
 class InactivityTimer;
+class QProgressDialog;
 class SearchWidget;
 class MainWindowEventFilter;
 
@@ -108,6 +109,7 @@ protected:
     bool focusNextPrevChild(bool next) override;
 
 private slots:
+    void showYubiKeyProgress(const QString& text);
     void updateMenuActionState();
     void updateToolbarSeparatorVisibility();
     void updateWindowTitle();
@@ -183,6 +185,8 @@ private:
     QPointer<QActionGroup> m_copyAdditionalAttributeActions;
     QPointer<QActionGroup> m_setTagsMenuActions;
     QPointer<InactivityTimer> m_inactivityTimer;
+    /// The progress dialog of a slow YubiKey operation, while it shows.
+    QPointer<QProgressDialog> m_yubiKeyProgress;
     int m_countDefaultAttributes;
     QPointer<QSystemTrayIcon> m_trayIcon;
     QPointer<ScreenLockListener> m_screenLockListener;

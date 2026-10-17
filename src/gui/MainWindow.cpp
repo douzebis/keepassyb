@@ -26,6 +26,7 @@
 #include <QInputDialog>
 #include <QList>
 #include <QMimeData>
+#include <QProgressDialog>
 #include <QShortcut>
 #include <QStatusBar>
 #include <QThread>
@@ -468,15 +469,10 @@ MainWindow::MainWindow()
                                              &ok);
         return ok ? entered : QString();
     });
-    // Post-quantum stores: one touch per vault read or saved.
-    storage->setTouchNotice([this] {
-        QMetaObject::invokeMethod(
-            this,
-            [this] {
-                displayGlobalMessage(tr("Touch your YubiKey…"), MessageWidget::Information, false);
-                QCoreApplication::processEvents();
-            },
-            QThread::currentThread() == thread() ? Qt::DirectConnection : Qt::QueuedConnection);
+    // Slow YubiKey operations, and the touch they wait for: a modal
+    // progress dialog (yb spec 0047 S4), shown after 300 ms.
+    storage->setProgress([this](const QString& text) {
+        QMetaObject::invokeMethod(this, [this, text] { showYubiKeyProgress(text); }, Qt::QueuedConnection);
     });
     storage->setNotice(
         [this](const QString& message) { displayGlobalMessage(message, MessageWidget::Information, true); });
@@ -1399,6 +1395,35 @@ void MainWindow::hideEvent(QHideEvent* event)
     // Qt Hack - Prevent white flicker when showing window
     setProperty("windowOpacity", 0.0);
 #endif
+}
+
+/**
+ * The progress dialog of a slow YubiKey operation (yb spec 0047 S4): `text`
+ * says what it does, or is empty when it ends.  It appears only after 300
+ * ms, so that a quick operation does not flash it, and it has no Cancel
+ * button: a YubiKey write must not be interrupted.
+ */
+void MainWindow::showYubiKeyProgress(const QString& text)
+{
+    if (text.isEmpty()) {
+        if (m_yubiKeyProgress) {
+            m_yubiKeyProgress->reset();
+            m_yubiKeyProgress->deleteLater();
+            m_yubiKeyProgress = nullptr;
+        }
+        return;
+    }
+    if (!m_yubiKeyProgress) {
+        m_yubiKeyProgress = new QProgressDialog(text, QString(), 0, 0, this);
+        m_yubiKeyProgress->setWindowTitle(tr("YubiKey"));
+        m_yubiKeyProgress->setWindowModality(Qt::ApplicationModal);
+        m_yubiKeyProgress->setCancelButton(nullptr);
+        m_yubiKeyProgress->setAutoClose(false);
+        m_yubiKeyProgress->setAutoReset(false);
+        m_yubiKeyProgress->setMinimumDuration(300);
+        return;
+    }
+    m_yubiKeyProgress->setLabelText(text);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)

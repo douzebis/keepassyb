@@ -751,3 +751,16 @@ void TestDeviceStorage::testOperationsRunOffTheGuiThread()
     DeviceStorage::instance()->listVaults({}, &error);
     QVERIFY(!fake->calledOnMainThread);
 }
+
+/// A slow operation reports its progress: what it does, the touch it
+/// waits for, then its end (yb spec 0047 S4).
+void TestDeviceStorage::testProgress()
+{
+    fake->kind = DeviceStorage::StoreKind::PostQuantum;
+    DeviceStorage::instance()->clearCache(); // a reformat, for the caches
+    QStringList shown;
+    DeviceStorage::instance()->setProgress([&shown](const QString& text) { shown << text; });
+    saveNewDatabase("progress");
+    DeviceStorage::instance()->setProgress({});
+    QCOMPARE(shown, QStringList({"Saving Passwords.kdbx to the YubiKey…", "Touch your YubiKey…", QString()}));
+}

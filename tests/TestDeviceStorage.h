@@ -49,6 +49,7 @@ private slots:
     void testListingIsDroppedAfterAWriteAndExpires();
     void testNothingReachesTheYubiKeyWhenQuitting();
     void testOperationsRunOffTheGuiThread();
+    void testProgress();
 };
 
 #endif // KEEPASSXC_TESTDEVICESTORAGE_H

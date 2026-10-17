@@ -163,6 +163,11 @@ public:
     using Notice = std::function<void(const QString& message)>;
     /// The YubiKey waits for a touch.
     using TouchNotice = std::function<void()>;
+    /// A slow YubiKey operation, for a progress dialog (yb spec 0047 S4):
+    /// what it does ("Saving … to the YubiKey…", then "Touch your
+    /// YubiKey…"), or an empty text when it ends.  Called on the
+    /// operation's thread.
+    using Progress = std::function<void(const QString& text)>;
 
     static DeviceStorage* instance();
 
@@ -228,6 +233,7 @@ public:
     void setUnverifiedReadPrompt(UnverifiedReadPrompt prompt);
     void setNotice(Notice notice);
     void setTouchNotice(TouchNotice notice);
+    void setProgress(Progress progress);
     /// KeePassYB is quitting: reads and status questions no longer reach
     /// the YubiKey (writes still do, for a save asked at exit).
     void setQuitting(bool quitting);
@@ -283,6 +289,7 @@ private:
     UnverifiedReadPrompt m_unverifiedReadPrompt;
     Notice m_notice;
     TouchNotice m_touchNotice;
+    Progress m_progress;
     /// Locations already told they are now stored unencrypted.
     QSet<QString> m_toldUnencrypted;
 
