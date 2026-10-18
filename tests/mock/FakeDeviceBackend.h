@@ -257,6 +257,10 @@ namespace fakedevice
             if (fake->kind == DeviceStorage::StoreKind::PostQuantum && touchNotice) {
                 ++fake->touches;
                 touchNotice();
+                // Touched at once.
+                if (touchedNotice) {
+                    touchedNotice();
+                }
             }
             return DeviceStorage::Ok;
         }

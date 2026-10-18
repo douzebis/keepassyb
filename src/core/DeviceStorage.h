@@ -167,6 +167,8 @@ public:
 
         /// Called (on the calling thread) when the YubiKey waits for a touch.
         std::function<void()> touchNotice;
+        /// Called when it no longer waits: touched, refused or timed out.
+        std::function<void()> touchedNotice;
     };
 
     /// Asks the user for the PIN of the YubiKey `serial` (empty: the only
@@ -186,7 +188,9 @@ public:
     /// what it does ("Saving … to the YubiKey…", then "Touch your
     /// YubiKey…"), or an empty text when it ends.  Called on the
     /// operation's thread.
-    using Progress = std::function<void(const QString& text)>;
+    /// `now`: show it at once (the YubiKey waits for a touch), rather than
+    /// after a short delay.
+    using Progress = std::function<void(const QString& text, bool now)>;
 
     static DeviceStorage* instance();
 

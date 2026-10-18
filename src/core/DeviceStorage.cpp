@@ -42,17 +42,21 @@ Q_LOGGING_CATEGORY(lcYubiKey, "keepassyb.yubikey", QtWarningMsg)
 class OpLog
 {
 public:
-    /// `shown`: what the progress dialog says while it runs.
-    OpLog(DeviceStorage* storage, const char* what, const QString& blob, const QString& shown)
+    /// `shown`: what the progress dialog says while it runs; `touch`: what
+    /// it says while the YubiKey waits for a touch (what the touch is for,
+    /// yb spec 0051 S5).
+    OpLog(DeviceStorage* storage, const char* what, const QString& blob, const QString& shown, const QString& touch)
         : m_storage(storage)
         , m_what(what)
         , m_blob(blob)
+        , m_text(shown)
+        , m_touchText(touch)
         , m_shown(shown)
     {
         m_total.start();
         m_storage->m_op = this;
         if (m_storage->m_progress) {
-            m_storage->m_progress(shown);
+            m_storage->m_progress(shown, false);
         }
     }
 
@@ -60,10 +64,10 @@ public:
     {
         m_storage->m_op = nullptr;
         if (m_storage->m_progress) {
-            m_storage->m_progress({});
+            m_storage->m_progress({}, false);
         }
         const auto total = m_total.elapsed();
-        const auto touch = m_touch.isValid() ? m_touch.elapsed() : 0;
+        const auto touch = m_touchMs >= 0 ? m_touchMs : m_touch.isValid() ? m_touch.elapsed() : 0;
         qCInfo(lcYubiKey).noquote() << QString("%1 %2: %3 in %4 ms (PIN prompt %5 ms, touch %6 ms, YubiKey %7 ms)")
                                            .arg(m_what, m_blob, m_outcome)
                                            .arg(total)
@@ -80,14 +84,26 @@ public:
     {
         m_pinMs += ms;
     }
+    /// The YubiKey waits for a touch: say what for, at once.
     void touchStarted()
     {
         if (!m_touch.isValid()) {
             m_touch.start();
         }
-        m_shown = QCoreApplication::translate("DeviceStorage", "Touch your YubiKey…");
+        m_shown = m_touchText;
         if (m_storage->m_progress) {
-            m_storage->m_progress(m_shown);
+            m_storage->m_progress(m_shown, true);
+        }
+    }
+    /// Touched, refused or timed out: back to what the operation does.
+    void touchEnded()
+    {
+        if (m_touch.isValid()) {
+            m_touchMs = m_touch.elapsed();
+        }
+        m_shown = m_text;
+        if (m_storage->m_progress) {
+            m_storage->m_progress(m_shown, false);
         }
     }
     /// A prompt (the PIN, a question) is shown: the progress dialog, which
@@ -95,11 +111,11 @@ public:
     void prompting(const std::function<void()>& prompt)
     {
         if (m_storage->m_progress) {
-            m_storage->m_progress({});
+            m_storage->m_progress({}, false);
         }
         prompt();
         if (m_storage->m_progress) {
-            m_storage->m_progress(m_shown);
+            m_storage->m_progress(m_shown, false);
         }
     }
 
@@ -107,8 +123,12 @@ private:
     DeviceStorage* m_storage;
     QString m_what;
     QString m_blob;
-    /// What the progress dialog says.
+    /// What the progress dialog says: the operation's text, or the touch's.
+    QString m_text;
+    QString m_touchText;
     QString m_shown;
+    /// How long the touch took, once over (-1: not over, or none).
+    qint64 m_touchMs = -1;
     QString m_outcome = QStringLiteral("failed");
     QElapsedTimer m_total;
     QElapsedTimer m_touch;
@@ -360,6 +380,14 @@ namespace
             }
         }
 
+        static void touchOver(void* user)
+        {
+            auto* self = static_cast<YubiblobBackend*>(user);
+            if (self->touchedNotice) {
+                self->touchedNotice();
+            }
+        }
+
         /// The YubiKey's snapshot session, opened (which reads the store)
         /// if there is none.
         DeviceStorage::Status session(const QString& serial, yubiblob_session_t** handle, QString* error)
@@ -376,6 +404,7 @@ namespace
             auto status = check(yubiblob_open(serial.toUInt(), YUBIBLOB_OPEN_SNAPSHOT, handle), error);
             if (status == DeviceStorage::Ok) {
                 yubiblob_set_touch_callback(*handle, &YubiblobBackend::touched, this);
+                yubiblob_set_touched_callback(*handle, &YubiblobBackend::touchOver, this);
                 m_sessions.insert(serial, *handle);
             }
             return status;
@@ -738,7 +767,11 @@ bool DeviceStorage::readImpl(const QString& location, QByteArray* data, QString*
         *error = tr("Not a device location: %1").arg(location);
         return false;
     }
-    OpLog op(this, "read", blob, tr("Reading %1 from the YubiKey…").arg(blob));
+    OpLog op(this,
+             "read",
+             blob,
+             tr("Reading %1 from the YubiKey…").arg(blob),
+             tr("Touch your YubiKey to read %1.").arg(blob));
     BlobInfo info;
     Status status;
     if (!find(serial, blob, &info, &status, error)) {
@@ -831,7 +864,8 @@ bool DeviceStorage::writeImpl(const QString& location,
         *error = tr("Not a device location: %1").arg(location);
         return false;
     }
-    OpLog op(this, "write", blob, tr("Saving %1 to the YubiKey…").arg(blob));
+    OpLog op(
+        this, "write", blob, tr("Saving %1 to the YubiKey…").arg(blob), tr("Touch your YubiKey to save %1.").arg(blob));
     StoreKind kind;
     if (!kindOf(serial, &kind, error)) {
         return false;
@@ -961,7 +995,11 @@ bool DeviceStorage::readPasswordImpl(const QString& location, QString* password,
     }
     password->clear();
     const auto passwd = stem(blob) + ".passwd";
-    OpLog op(this, "read stored password", passwd, tr("Reading the master password from the YubiKey…"));
+    OpLog op(this,
+             "read stored password",
+             passwd,
+             tr("Reading the master password from the YubiKey…"),
+             tr("Touch your YubiKey to read the master password kept on it."));
     BlobInfo info;
     Status status;
     if (!find(serial, passwd, &info, &status, error)) {
@@ -1005,7 +1043,11 @@ bool DeviceStorage::removePasswordImpl(const QString& location, QString* error)
         return false;
     }
     const auto passwd = stem(blob) + ".passwd";
-    OpLog op(this, "remove stored password", passwd, tr("Deleting %1 from the YubiKey…").arg(passwd));
+    OpLog op(this,
+             "remove stored password",
+             passwd,
+             tr("Deleting %1 from the YubiKey…").arg(passwd),
+             tr("Touch your YubiKey to delete the master password kept on it."));
     QString detail;
     int tries = -1;
     auto status = m_backend->remove(serial, passwd, pin, &detail, &tries);
@@ -1049,7 +1091,11 @@ bool DeviceStorage::storePasswordImpl(const QString& location, const QString& pa
         return false;
     }
     const auto passwd = stem(blob) + ".passwd";
-    OpLog op(this, "store password", passwd, tr("Saving the master password to the YubiKey…"));
+    OpLog op(this,
+             "store password",
+             passwd,
+             tr("Saving the master password to the YubiKey…"),
+             tr("Touch your YubiKey to keep the master password on it."));
     auto bytes = password.toUtf8();
     QString detail;
     int tries = -1;
@@ -1235,6 +1281,12 @@ void DeviceStorage::setBackend(std::unique_ptr<Backend> backend)
         }
         if (m_touchNotice) {
             m_touchNotice();
+        }
+    };
+    m_backend->touchedNotice = [this] {
+        qCInfo(lcYubiKey) << "touch over";
+        if (m_op) {
+            m_op->touchEnded();
         }
     };
 }

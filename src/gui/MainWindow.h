@@ -109,7 +109,7 @@ protected:
     bool focusNextPrevChild(bool next) override;
 
 private slots:
-    void showYubiKeyProgress(const QString& text);
+    void showYubiKeyProgress(const QString& text, bool now = false);
     void updateMenuActionState();
     void updateToolbarSeparatorVisibility();
     void updateWindowTitle();

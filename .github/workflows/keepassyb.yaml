@@ -6,8 +6,8 @@
 # License.
 
 # KeePassYB's CI (yb spec 0046 S6): build and test on Linux, macOS and
-# Windows, with libyubiblob built from yb's source at YB_REV (0.4 or later:
-# snapshot sessions and IF_UNCHANGED, yb specs 0048 to 0050).
+# Windows, with libyubiblob built from yb's source at YB_REV (0.5 or later:
+# snapshot sessions, IF_UNCHANGED, the end of a touch; yb specs 0048 to 0051).
 #
 # - Linux: yb's build shell (Nix, contrib/keepassxc/shell.nix), as on a
 #   developer's machine; the tests under a virtual X server.
@@ -30,7 +30,7 @@ permissions:
 
 env:
   # yb's commit providing libyubiblob and the build shell; bumped with yb.
-  YB_REV: f2357908c35c91ef2cff1522ac777ea3f322374c
+  YB_REV: a9132718d6a76ffc28bad410d8dc2f9141788e9d
   # The Nix build's Rust, as yb's own CI uses.
   RUST_TOOLCHAIN: "1.98.1"
   CARGO_C_VERSION: "0.10.22"

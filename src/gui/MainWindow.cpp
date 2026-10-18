@@ -470,9 +470,10 @@ MainWindow::MainWindow()
         return ok ? entered : QString();
     });
     // Slow YubiKey operations, and the touch they wait for: a modal
-    // progress dialog (yb spec 0047 S4), shown after 300 ms.
-    storage->setProgress([this](const QString& text) {
-        QMetaObject::invokeMethod(this, [this, text] { showYubiKeyProgress(text); }, Qt::QueuedConnection);
+    // progress dialog (yb spec 0047 S4), shown after 300 ms, at once for a
+    // touch (yb spec 0051 S5).
+    storage->setProgress([this](const QString& text, bool now) {
+        QMetaObject::invokeMethod(this, [this, text, now] { showYubiKeyProgress(text, now); }, Qt::QueuedConnection);
     });
     storage->setNotice(
         [this](const QString& message) { displayGlobalMessage(message, MessageWidget::Information, true); });
@@ -1403,7 +1404,7 @@ void MainWindow::hideEvent(QHideEvent* event)
  * ms, so that a quick operation does not flash it, and it has no Cancel
  * button: a YubiKey write must not be interrupted.
  */
-void MainWindow::showYubiKeyProgress(const QString& text)
+void MainWindow::showYubiKeyProgress(const QString& text, bool now)
 {
     if (text.isEmpty()) {
         if (m_yubiKeyProgress) {
@@ -1421,9 +1422,12 @@ void MainWindow::showYubiKeyProgress(const QString& text)
         m_yubiKeyProgress->setAutoClose(false);
         m_yubiKeyProgress->setAutoReset(false);
         m_yubiKeyProgress->setMinimumDuration(300);
-        return;
+    } else {
+        m_yubiKeyProgress->setLabelText(text);
     }
-    m_yubiKeyProgress->setLabelText(text);
+    if (now) {
+        m_yubiKeyProgress->show();
+    }
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)

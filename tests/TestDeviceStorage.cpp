@@ -642,7 +642,9 @@ void TestDeviceStorage::testProgress()
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     QStringList shown;
-    DeviceStorage::instance()->setProgress([&shown](const QString& text) { shown << text; });
+    // "!": shown at once (a touch, yb spec 0051 S5).
+    DeviceStorage::instance()->setProgress(
+        [&shown](const QString& text, bool now) { shown << (now ? "!" + text : text); });
     // The PIN prompt is not shown under the (modal) progress dialog: it is
     // hidden first, and comes back after.
     DeviceStorage::instance()->setPinPrompt([&shown](const QString&, DeviceStorage::StoreKind) {
@@ -656,7 +658,8 @@ void TestDeviceStorage::testProgress()
                           QString(),
                           "PIN?",
                           "Saving Passwords.kdbx to the YubiKey…",
-                          "Touch your YubiKey…",
+                          "!Touch your YubiKey to save Passwords.kdbx.",
+                          "Saving Passwords.kdbx to the YubiKey…",
                           QString()}));
 }
 

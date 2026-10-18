@@ -563,12 +563,13 @@ include_directories(SYSTEM ${MINIZIP_INCLUDE_DIR})
 # Find libyubiblob (yb) for databases stored on a YubiKey
 if(KPXC_FEATURE_YUBIBLOB)
     find_package(PkgConfig REQUIRED)
-    # 0.4: snapshot sessions and IF_UNCHANGED (yb specs 0049, 0050).  The
+    # 0.5: the end of a touch (yb spec 0051 S5); 0.4: snapshot sessions and
+    # IF_UNCHANGED (yb specs 0049, 0050).  The
     # library's path is cached apart from the rest, and not looked for
     # again: drop it, so that a new libyubiblob (a new Nix store path) is
     # the one linked, as its header is the one compiled with.
     unset(pkgcfg_lib_YUBIBLOB_yubiblob CACHE)
-    pkg_check_modules(YUBIBLOB REQUIRED IMPORTED_TARGET yubiblob>=0.4)
+    pkg_check_modules(YUBIBLOB REQUIRED IMPORTED_TARGET yubiblob>=0.5)
     message(STATUS "Using libyubiblob ${YUBIBLOB_VERSION}")
 endif()
 

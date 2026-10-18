@@ -16,7 +16,7 @@ Everything else is KeePassXC.  The design of each change is in yb's specs
 - **The GUI:** Open and Save As offer the YubiKey's vaults next to a file
   ("A file…" first); a new database can be saved to the YubiKey.
   `keepassyb-cli` opens `yubikey:` locations too.
-- **The build:** `KPXC_FEATURE_YUBIBLOB` (on), libyubiblob 0.4 or later
+- **The build:** `KPXC_FEATURE_YUBIBLOB` (on), libyubiblob 0.5 or later
   through pkg-config.
 - *Why:* yb keeps blobs in the YubiKey's PIV objects, and replaces them
   safely: an interrupted save keeps the previous version (yb invariant
@@ -52,9 +52,12 @@ Everything else is KeePassXC.  The design of each change is in yb's specs
   costs time on the YubiKey.  (Spec 0050 S1.)
 - **Off the GUI thread:** YubiKey operations run on a worker thread, one
   at a time; the window keeps responding.  (Spec 0047 S2.)
-- **A progress dialog** for slow operations ("Saving … to the YubiKey…",
-  "Touch your YubiKey…"), hidden while a prompt is shown.  (Spec 0047
-  S4.)
+- **A progress dialog** for slow operations ("Saving … to the
+  YubiKey…"), hidden while a prompt is shown.  When the YubiKey waits for
+  a touch, it says what for ("Touch your YubiKey to save
+  Passwords.kdbx."), at once; once the touch is over, it says again what
+  the operation does.
+  (Specs 0047 S4, 0051 S5.)
 - **No automatic challenge-response scan** in a vault's unlock dialog:
   it would reach the same YubiKey; the refresh button still scans.
   (Spec 0047 S5.)
