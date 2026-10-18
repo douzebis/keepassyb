@@ -73,12 +73,16 @@ Everything else is KeePassXC.  The design of each change is in yb's specs
   close and exit save at once.  KeePassXC's two auto-save settings apply.
   *Why:* the PIN prompt and the touch then follow the edit that needs
   them.  (Specs 0050 S2, 0051 S1.)
-- **Only real changes:** before a write, the vault's content is compared
-  with what was read or saved, leaving out what changes without a data
-  change (KeePassXC's random padding, the view state, access times and
-  counts, modification times).  Unchanged: nothing is written.  *Why:*
-  a change of view (an expanded group) marks a database modified.
-  (Spec 0047 S2.)
+- **Only real changes:** before an automatic write, the vault's data is
+  compared with what was read or saved, leaving out KeePassXC's random
+  padding, access times and counts, modification times, and the
+  presentation (expanded groups, the order of entries).  Unchanged:
+  nothing is written.  *Why:* a change of view (an expanded group) marks
+  a database modified.  (Spec 0047 S2.)
+- **The presentation waits,** as KeePassXC does for a file: it goes along
+  with the next save, and is saved at lock, close and exit ("Automatically
+  save non-data changes when locking"); a failure then asks nothing.
+  (Spec 0052.)
 - **A failed save:** an automatic one shows the reason with Retry, and is
   not tried again until the content changes (no loop of prompts); at
   lock or exit: Retry, Save as a file, Discard (confirmed), Cancel.

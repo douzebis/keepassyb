@@ -235,3 +235,131 @@ void TestDeviceAutoSave::testChangedOnTheYubiKeyAsks()
     QTRY_COMPARE_WITH_TIMEOUT(fake->stores, stores + 1, 3000);
     QVERIFY(fake->blobs.value("Passwords.kdbx") != onCard);
 }
+
+/// A collapsed group, saved to the YubiKey.
+Group* TestDeviceAutoSave::savedFoldedGroup()
+{
+    auto* group = new Group();
+    group->setUuid(QUuid::createUuid());
+    group->setName("folded");
+    group->setParent(m_db->rootGroup());
+    group->setExpanded(false);
+    const auto stores = fake->stores;
+    change("with the group");
+    [&] { QTRY_COMPARE_WITH_TIMEOUT(fake->stores, stores + 1, 2000); }();
+    return group;
+}
+
+/// Whether the group is expanded in the vault as stored on the YubiKey.
+bool TestDeviceAutoSave::rereadExpanded(const QUuid& uuid)
+{
+    auto reread = QSharedPointer<Database>::create();
+    QString error;
+    if (!reread->open(Location, key(), &error)) {
+        qWarning() << error;
+        return false;
+    }
+    const auto* group = reread->rootGroup()->findGroupByUuid(uuid);
+    return group && group->isExpanded();
+}
+
+/// A change of presentation waits for the next data change, and goes along
+/// with it (yb spec 0052 S2).
+void TestDeviceAutoSave::testViewStateGoesAlongWithAChange()
+{
+    auto* group = savedFoldedGroup();
+    const auto stores = fake->stores;
+    group->setExpanded(true);
+    nothingStoredFor(600);
+    change("along");
+    QTRY_COMPARE_WITH_TIMEOUT(fake->stores, stores + 1, 2000);
+    QVERIFY(rereadExpanded(group->uuid()));
+}
+
+/// The automatic save writes no change of presentation alone: an expanded
+/// group, an entry moved, even with the vault marked modified (yb spec
+/// 0052 S1, S2).
+void TestDeviceAutoSave::testAutoSaveSkipsPresentation()
+{
+    auto* group = savedFoldedGroup();
+    change("second");
+    QTRY_VERIFY_WITH_TIMEOUT(!m_db->isModified(), 2000);
+    const auto attempts = fake->storeAttempts;
+    group->setExpanded(true);
+    auto* entry = m_db->rootGroup()->entries().last();
+    m_db->rootGroup()->moveEntryUp(entry);
+    m_db->markAsModified();
+    QTRY_VERIFY_WITH_TIMEOUT(!m_db->isModified(), 2000);
+    QCOMPARE(fake->storeAttempts, attempts);
+    // Still pending: Save is offered.
+    QVERIFY(m_db->hasNonDataChanges());
+    QVERIFY(m_db->devicePresentationPending());
+}
+
+/// Save, enabled because the vault is marked modified, writes a change of
+/// presentation, as KeePassXC writes the whole file (yb spec 0052 S2).
+void TestDeviceAutoSave::testSaveWritesPresentation()
+{
+    auto* group = savedFoldedGroup();
+    const auto stores = fake->stores;
+    group->setExpanded(true);
+    m_db->markAsModified();
+    m_widget->saveSoon();
+    QTRY_COMPARE_WITH_TIMEOUT(fake->stores, stores + 1, 2000);
+    QVERIFY(rereadExpanded(group->uuid()));
+    QVERIFY(!m_db->devicePresentationPending());
+}
+
+/// Lock writes a change of presentation, without a question (yb spec 0052
+/// S2).
+void TestDeviceAutoSave::testLockWritesPresentation()
+{
+    auto* group = savedFoldedGroup();
+    const auto uuid = group->uuid();
+    const auto stores = fake->stores;
+    group->setExpanded(true);
+    MessageBox::setNextAnswer(MessageBox::Cancel);
+    QVERIFY(m_widget->lock());
+    QCOMPARE(fake->stores, stores + 1);
+    QVERIFY(rereadExpanded(uuid));
+}
+
+/// With KeePassXC's "Automatically save non-data changes when locking"
+/// off, lock writes no change of presentation, as for a file.
+void TestDeviceAutoSave::testLockLeavesPresentationWhenSettingIsOff()
+{
+    config()->set(Config::AutoSaveNonDataChanges, false);
+    auto* group = savedFoldedGroup();
+    const auto stores = fake->stores;
+    group->setExpanded(true);
+    MessageBox::setNextAnswer(MessageBox::Cancel);
+    QVERIFY(m_widget->lock());
+    QCOMPARE(fake->stores, stores);
+}
+
+/// A group expanded, then collapsed back: nothing to write.
+void TestDeviceAutoSave::testPresentationRevertedIsNotWritten()
+{
+    auto* group = savedFoldedGroup();
+    const auto attempts = fake->storeAttempts;
+    group->setExpanded(true);
+    group->setExpanded(false);
+    QVERIFY(!m_db->devicePresentationPending());
+    MessageBox::setNextAnswer(MessageBox::Cancel);
+    QVERIFY(m_widget->lock());
+    QCOMPARE(fake->storeAttempts, attempts);
+}
+
+/// A presentation save that fails at lock (the touch refused) asks nothing
+/// and does not stop the lock (yb spec 0052 S2).
+void TestDeviceAutoSave::testPresentationSaveFailureDoesNotStopLock()
+{
+    auto* group = savedFoldedGroup();
+    const auto attempts = fake->storeAttempts;
+    group->setExpanded(true);
+    fake->locked = DeviceStorage::NoTouch;
+    // Were a question asked, it would be cancelled, and the lock refused.
+    MessageBox::setNextAnswer(MessageBox::Cancel);
+    QVERIFY(m_widget->lock());
+    QCOMPARE(fake->storeAttempts, attempts + 1);
+}

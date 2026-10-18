@@ -36,6 +36,7 @@
 #include <QSaveFile>
 #include <QTemporaryFile>
 #include <QTimer>
+#include <QXmlStreamReader>
 
 #include <algorithm>
 
@@ -211,7 +212,7 @@ bool Database::open(const QString& filePath, QSharedPointer<const CompositeKey> 
 
     markAsClean();
     if (onDevice && withKey) {
-        m_deviceContentHash = contentHash();
+        recordDeviceHashes();
     }
 
     emit databaseOpened();
@@ -481,7 +482,7 @@ bool Database::saveToDevice(const QString& location, QString* error)
         setFilePath(location);
         markAsClean();
         m_ignoreFileChangesUntilSaved = false;
-        m_deviceContentHash = contentHash();
+        recordDeviceHashes();
     } else {
         markAsModified();
     }
@@ -660,40 +661,144 @@ bool Database::extract(QByteArray& xmlOutput, QString* error)
     return true;
 }
 
-QByteArray Database::contentHash()
+namespace
+{
+    /// The XML with each group's entries sorted by UUID: the order of
+    /// entries in a group is presentation, not data (yb spec 0052 S1).
+    /// Only for hashing: the result is not a KDBX document.
+    QString withSortedEntries(const QString& xml)
+    {
+        struct Element
+        {
+            QString name;
+            QString out;
+            QString text;
+            QString uuid;
+            QList<QPair<QString, QString>> entries;
+        };
+        QList<Element> stack{{}};
+        QXmlStreamReader reader(xml);
+        while (!reader.atEnd()) {
+            reader.readNext();
+            if (reader.isStartElement()) {
+                Element element{reader.name().toString(), {}, {}, {}, {}};
+                element.out = QLatin1Char('<') + element.name;
+                for (const auto& attribute : reader.attributes()) {
+                    element.out += QStringLiteral(" %1=\"%2\"").arg(attribute.qualifiedName(), attribute.value());
+                }
+                element.out += QLatin1Char('>');
+                stack.append(element);
+            } else if (reader.isCharacters() && !reader.isWhitespace()) {
+                stack.last().out += reader.text().toString().toHtmlEscaped();
+                stack.last().text += reader.text();
+            } else if (reader.isEndElement() && stack.size() > 1) {
+                auto element = stack.takeLast();
+                if (element.name == QLatin1String("Group")) {
+                    std::stable_sort(element.entries.begin(), element.entries.end(), [](const auto& a, const auto& b) {
+                        return a.first < b.first;
+                    });
+                    for (const auto& entry : asConst(element.entries)) {
+                        element.out += entry.second;
+                    }
+                }
+                element.out += QStringLiteral("</%1>").arg(element.name);
+                auto& parent = stack.last();
+                if (element.name == QLatin1String("UUID") && parent.name == QLatin1String("Entry")
+                    && parent.uuid.isEmpty()) {
+                    parent.uuid = element.text;
+                }
+                if (element.name == QLatin1String("Entry") && parent.name == QLatin1String("Group")) {
+                    parent.entries.append({element.uuid, element.out});
+                } else {
+                    parent.out += element.out;
+                }
+                element.out.fill(QChar(0));
+                element.text.fill(QChar(0));
+            }
+        }
+        if (reader.hasError()) {
+            return {};
+        }
+        return stack.first().out;
+    }
+
+    QByteArray hashOf(const QString& text)
+    {
+        auto bytes = text.toUtf8();
+        const auto hash = QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
+        bytes.fill('\0');
+        return hash;
+    }
+} // namespace
+
+bool Database::deviceHashes(QByteArray* content, QByteArray* full)
 {
     QByteArray xml;
     if (!extract(xml)) {
-        return {};
+        return false;
     }
     auto text = QString::fromUtf8(xml);
     xml.fill('\0');
-    // What changes without a data change: the random padding added on each
-    // save and the last-modified stamp of custom data, the view's state
-    // (selected and visible groups, expanded groups), access times and
-    // counts, and modification times (expanding a group stamps it as
-    // modified).  A real change still differs: it changes the data itself.
+    // What changes at every save: the random padding and the last-modified
+    // stamp of custom data.
     static const QRegularExpression volatileItems(QStringLiteral("<Item>\\s*<Key>(?:%1|%2)</Key>.*?</Item>")
                                                       .arg(QRegularExpression::escape(CustomData::RandomSlug),
                                                            QRegularExpression::escape(CustomData::LastModified)),
                                                   QRegularExpression::DotMatchesEverythingOption);
+    // What changes as a side effect, and is never worth a write by itself:
+    // access times and counts, and modification times (expanding a group
+    // stamps it as modified).
+    static const QRegularExpression times(
+        QStringLiteral("<(LastAccessTime|UsageCount|LastModificationTime)\\s*/>"
+                       "|<(LastAccessTime|UsageCount|LastModificationTime)>[^<]*</\\2>"));
+    // The presentation (yb spec 0052 S1): the view's state (selected and
+    // visible groups, expanded groups); and, below, the order of entries
+    // in a group.
     static const QRegularExpression viewState(
-        QStringLiteral("<(LastSelectedGroup|LastTopVisibleGroup|IsExpanded|LastAccessTime|UsageCount|"
-                       "LastModificationTime)\\s*/>"
-                       "|<(LastSelectedGroup|LastTopVisibleGroup|IsExpanded|LastAccessTime|UsageCount|"
-                       "LastModificationTime)>[^<]*</\\2>"));
+        QStringLiteral("<(LastSelectedGroup|LastTopVisibleGroup|IsExpanded)\\s*/>"
+                       "|<(LastSelectedGroup|LastTopVisibleGroup|IsExpanded)>[^<]*</\\2>"));
     text.remove(volatileItems);
+    text.remove(times);
+    if (full) {
+        *full = hashOf(text);
+    }
     text.remove(viewState);
-    auto bytes = text.toUtf8();
+    auto sorted = withSortedEntries(text);
     text.fill(QChar(0));
-    const auto hash = QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
-    bytes.fill('\0');
-    return hash;
+    if (sorted.isEmpty()) {
+        return false;
+    }
+    if (content) {
+        *content = hashOf(sorted);
+    }
+    sorted.fill(QChar(0));
+    return true;
+}
+
+QByteArray Database::contentHash()
+{
+    QByteArray content;
+    return deviceHashes(&content, nullptr) ? content : QByteArray();
+}
+
+void Database::recordDeviceHashes()
+{
+    if (!deviceHashes(&m_deviceContentHash, &m_deviceFullHash)) {
+        m_deviceContentHash.clear();
+        m_deviceFullHash.clear();
+    }
 }
 
 bool Database::deviceContentUnchanged()
 {
     return !m_deviceContentHash.isEmpty() && contentHash() == m_deviceContentHash;
+}
+
+bool Database::devicePresentationPending()
+{
+    QByteArray content, full;
+    return !m_deviceContentHash.isEmpty() && deviceHashes(&content, &full) && content == m_deviceContentHash
+           && full != m_deviceFullHash;
 }
 
 bool Database::import(const QString& xmlExportPath, QString* error)

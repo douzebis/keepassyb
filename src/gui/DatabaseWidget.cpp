@@ -1965,8 +1965,9 @@ void DatabaseWidget::onAutosaveDelayTimeout()
 }
 
 /// The changes to a vault on the YubiKey have paused (yb spec 0050 S2): save
-/// it, if its content changed.  A change of view (an expanded group, a
-/// selection) leaves the content as it was, and is never written.
+/// it, if its data changed.  A change of presentation alone (an expanded
+/// group, an entry moved) waits for Save, lock, close or exit (yb spec 0052
+/// S2).
 void DatabaseWidget::onDeviceSaveDelayTimeout()
 {
     const bool asked = std::exchange(m_deviceSaveRequested, false);
@@ -1990,12 +1991,21 @@ void DatabaseWidget::onDeviceSaveDelayTimeout()
         return;
     }
     if (m_db->deviceContentUnchanged()) {
-        qCInfo(lcYubiKey).noquote()
-            << QString("automatic save: %1 unchanged in content: not saved").arg(m_db->filePath());
-        m_db->markAsClean();
-        return;
+        const bool presentation = m_db->devicePresentationPending();
+        if (!(asked && presentation)) {
+            const auto waits =
+                presentation ? QStringLiteral(" (its presentation waits for Save, lock or exit)") : QString();
+            qCInfo(lcYubiKey).noquote()
+                << QString("automatic save: %1 unchanged in content: not saved%2").arg(m_db->filePath(), waits);
+            m_db->markAsClean();
+            if (presentation) {
+                m_db->markNonDataChange();
+            }
+            return;
+        }
     }
-    m_deviceSaveTrigger = QStringLiteral("automatic, after the changes paused");
+    m_deviceSaveTrigger = asked ? QStringLiteral("Save, after the requests paused")
+                                : QStringLiteral("automatic, after the changes paused");
     if (save()) {
         m_deviceFailedContent.clear();
     } else {
@@ -2218,7 +2228,7 @@ bool DatabaseWidget::lock()
         // was read or saved (yb spec 0047 S2).
         if (m_db->isModified() && m_db->deviceContentUnchanged()) {
             qCInfo(lcYubiKey).noquote() << QString("lock: %1 marked modified, but its content is unchanged: "
-                                                   "not saved")
+                                                   "not saved as a data change")
                                                .arg(m_db->filePath());
             m_db->markAsClean();
         }
@@ -2284,6 +2294,19 @@ bool DatabaseWidget::lock()
         // Silently auto-save non-data changes, ignore errors
         QString errorMessage;
         performSave(errorMessage);
+    } else if (isOnDevice() && config()->get(Config::AutoSaveNonDataChanges).toBool()
+               && m_db->devicePresentationPending()) {
+        // A change of presentation alone, as KeePassXC does for a file: a
+        // regular save, but its failure (PIN prompt cancelled, touch
+        // refused, YubiKey gone, changed by another program) asks nothing
+        // and does not stop the lock (yb spec 0052 S2).
+        qCInfo(lcYubiKey).noquote()
+            << QString("save: %1, trigger lock, close or exit (presentation only)").arg(m_db->filePath());
+        QString errorMessage;
+        if (!performSave(errorMessage)) {
+            qCInfo(lcYubiKey).noquote()
+                << QString("lock: %1, its presentation not saved: %2").arg(m_db->filePath(), errorMessage);
+        }
     }
 
     // The device's PIN is held only while the database is unlocked.

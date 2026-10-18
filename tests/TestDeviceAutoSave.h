@@ -21,9 +21,11 @@
 #include <QObject>
 #include <QPointer>
 #include <QSharedPointer>
+#include <QUuid>
 
 class Database;
 class DatabaseWidget;
+class Group;
 
 /// Automatic saves of a vault on a YubiKey (yb spec 0050 S2), on a
 /// DatabaseWidget over the in-memory YubiKey of mock/FakeDeviceBackend.h.
@@ -45,10 +47,19 @@ private slots:
     void testLockSavesWithoutAsking();
     void testLockAsksWhenAutoSaveOnExitIsOff();
     void testChangedOnTheYubiKeyAsks();
+    void testViewStateGoesAlongWithAChange();
+    void testAutoSaveSkipsPresentation();
+    void testSaveWritesPresentation();
+    void testLockWritesPresentation();
+    void testLockLeavesPresentationWhenSettingIsOff();
+    void testPresentationRevertedIsNotWritten();
+    void testPresentationSaveFailureDoesNotStopLock();
 
 private:
     void change(const QString& title, bool waitForReport = true);
     void nothingStoredFor(int ms);
+    Group* savedFoldedGroup();
+    bool rereadExpanded(const QUuid& uuid);
 
     QSharedPointer<Database> m_db;
     QPointer<DatabaseWidget> m_widget;
