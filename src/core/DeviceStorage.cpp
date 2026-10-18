@@ -44,6 +44,7 @@ public:
         : m_storage(storage)
         , m_what(what)
         , m_blob(blob)
+        , m_shown(shown)
     {
         m_total.start();
         m_storage->m_op = this;
@@ -81,8 +82,21 @@ public:
         if (!m_touch.isValid()) {
             m_touch.start();
         }
+        m_shown = QCoreApplication::translate("DeviceStorage", "Touch your YubiKey…");
         if (m_storage->m_progress) {
-            m_storage->m_progress(QCoreApplication::translate("DeviceStorage", "Touch your YubiKey…"));
+            m_storage->m_progress(m_shown);
+        }
+    }
+    /// A prompt (the PIN, a question) is shown: the progress dialog, which
+    /// is modal, steps aside, then comes back.
+    void prompting(const std::function<void()>& prompt)
+    {
+        if (m_storage->m_progress) {
+            m_storage->m_progress({});
+        }
+        prompt();
+        if (m_storage->m_progress) {
+            m_storage->m_progress(m_shown);
         }
     }
 
@@ -90,6 +104,8 @@ private:
     DeviceStorage* m_storage;
     QString m_what;
     QString m_blob;
+    /// What the progress dialog says.
+    QString m_shown;
     QString m_outcome = QStringLiteral("failed");
     QElapsedTimer m_total;
     QElapsedTimer m_touch;
@@ -549,6 +565,17 @@ DeviceStorage::describe(Status status, const QString& detail, const QString& blo
     }
 }
 
+void DeviceStorage::prompt(const std::function<void()>& f)
+{
+    // Not under the progress dialog (yb spec 0047 S4): it is modal, and
+    // would take the keyboard from the prompt.
+    if (m_op) {
+        m_op->prompting([&] { onGuiThread(f); });
+    } else {
+        onGuiThread(f);
+    }
+}
+
 void DeviceStorage::onGuiThread(const std::function<void()>& f) const
 {
     // Saves run on a worker thread; prompts are GUI, so they run on the GUI
@@ -568,7 +595,7 @@ bool DeviceStorage::pinFor(const QString& serial, StoreKind kind, QByteArray* pi
         if (m_pinPrompt) {
             QElapsedTimer waited;
             waited.start();
-            onGuiThread([&] { entered = m_pinPrompt(serial, kind); });
+            prompt([&] { entered = m_pinPrompt(serial, kind); });
             if (m_op) {
                 m_op->addPinWait(waited.elapsed());
             }
@@ -690,7 +717,7 @@ bool DeviceStorage::readUnverified(const QString& serial,
     }
     bool agreed = false;
     if (m_unverifiedReadPrompt) {
-        onGuiThread([&] { agreed = m_unverifiedReadPrompt(blob, reason, isBeforeKdbx4(bytes)); });
+        prompt([&] { agreed = m_unverifiedReadPrompt(blob, reason, isBeforeKdbx4(bytes)); });
     }
     if (!agreed) {
         bytes.fill('\0');

@@ -304,6 +304,8 @@ private:
     QString describe(Status status, const QString& detail, const QString& blob, int pinTries, StoreKind kind) const;
     /// Run `f` on the GUI thread (prompts), blocking the calling thread.
     void onGuiThread(const std::function<void()>& f) const;
+    /// Run the prompt `f` on the GUI thread, the progress dialog hidden.
+    void prompt(const std::function<void()>& f);
 
     friend class OpLog;
     /// The operation being timed, if any (operations do not overlap).

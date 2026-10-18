@@ -641,9 +641,21 @@ void TestDeviceStorage::testProgress()
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     QStringList shown;
     DeviceStorage::instance()->setProgress([&shown](const QString& text) { shown << text; });
+    // The PIN prompt is not shown under the (modal) progress dialog: it is
+    // hidden first, and comes back after.
+    DeviceStorage::instance()->setPinPrompt([&shown](const QString&, DeviceStorage::StoreKind) {
+        shown << "PIN?";
+        return Pin;
+    });
     saveNewDatabase("progress");
     DeviceStorage::instance()->setProgress({});
-    QCOMPARE(shown, QStringList({"Saving Passwords.kdbx to the YubiKey…", "Touch your YubiKey…", QString()}));
+    QCOMPARE(shown,
+             QStringList({"Saving Passwords.kdbx to the YubiKey…",
+                          QString(),
+                          "PIN?",
+                          "Saving Passwords.kdbx to the YubiKey…",
+                          "Touch your YubiKey…",
+                          QString()}));
 }
 
 /// The unchanged-content check (yb spec 0047 S2): a vault marked modified
