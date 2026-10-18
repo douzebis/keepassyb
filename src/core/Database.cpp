@@ -20,6 +20,7 @@
 
 #include "core/AsyncTask.h"
 #include "core/DeviceStorage.h"
+#include "core/Entry.h"
 #include "core/FileWatcher.h"
 #include "core/Group.h"
 #include "crypto/Random.h"
@@ -417,9 +418,36 @@ bool Database::saveToDevice(const QString& location, QString* error)
         }
     }
 
-    // Add random data to prevent side-channel data deduplication attacks
-    int length = Random::instance()->randomUIntRange(64, 512);
-    m_metadata->customData()->set(CustomData::RandomSlug, Random::instance()->randomArray(length).toHex());
+    // Random padding against a size side channel through KeeShare
+    // (KeePassXC commit 72fc0069): only for a vault that uses KeeShare,
+    // whose room on a YubiKey is otherwise wasted (yb spec 0051 S2).  The
+    // key is KeeShare's own (KeeShare::isShared), tested here so that the
+    // core does not depend on KeeShare.
+    const auto groups = m_rootGroup->groupsRecursive(true);
+    const bool usesKeeShare = std::any_of(groups.cbegin(), groups.cend(), [](const Group* group) {
+        return group->customData()->contains(QStringLiteral("KeeShare/Reference"));
+    });
+    if (usesKeeShare) {
+        int length = Random::instance()->randomUIntRange(64, 512);
+        m_metadata->customData()->set(CustomData::RandomSlug, Random::instance()->randomArray(length).toHex());
+    } else {
+        m_metadata->customData()->remove(CustomData::RandomSlug);
+    }
+
+    // First saved to a YubiKey (a new vault, or Save As from a file): no
+    // old versions of entries by default, to save room; the user may raise
+    // the setting (yb spec 0051 S4).
+    const bool firstOnDevice = !DeviceStorage::isDeviceLocation(m_data.filePath);
+    if (firstOnDevice && m_metadata->historyMaxItems() != 0) {
+        m_metadata->setHistoryMaxItems(0);
+        for (auto* entry : m_rootGroup->entriesRecursive(true)) {
+            entry->truncateHistory();
+        }
+        DeviceStorage::instance()->notify(
+            tr("%1 keeps no old versions of its entries on the YubiKey, to save room: change it in Database "
+               "settings, History.")
+                .arg(location.section('/', -1)));
+    }
 
     QMutexLocker locker(&m_saveMutex);
 

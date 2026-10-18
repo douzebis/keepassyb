@@ -75,9 +75,12 @@
 
 namespace
 {
-    /// The least time without a change before a vault on the YubiKey is
-    /// saved (yb spec 0050 S2).
-    constexpr int kDeviceQuietDelayMs = 10000;
+    /// A vault on the YubiKey is saved 0.25 s after the last request (yb
+    /// spec 0051 S1): a change (which KeePassXC reports 150 ms after it is
+    /// made, hence 100 ms from the report), the end of a YubiKey
+    /// operation, or a request to save.
+    constexpr int kDeviceAfterChangeMs = 100;
+    constexpr int kDeviceSettleMs = 250;
 } // namespace
 
 DatabaseWidget::DatabaseWidget(QSharedPointer<Database> db, QWidget* parent)
@@ -242,6 +245,7 @@ DatabaseWidget::DatabaseWidget(QSharedPointer<Database> db, QWidget* parent)
     connect(m_autosaveTimer, SIGNAL(timeout()), this, SLOT(onAutosaveDelayTimeout()));
 
     m_deviceSaveTimer = new QTimer(this);
+    m_deviceSaveTimer->setObjectName(QStringLiteral("deviceSaveTimer"));
     m_deviceSaveTimer->setSingleShot(true);
     connect(m_deviceSaveTimer, &QTimer::timeout, this, &DatabaseWidget::onDeviceSaveDelayTimeout);
     m_deviceRetry = new QAction(tr("Retry"), this);
@@ -1922,12 +1926,10 @@ void DatabaseWidget::onDatabaseModified()
     refreshSearch();
     m_remoteSettings->loadSettings();
     if (isOnDevice()) {
-        // Saved once the changes pause (yb spec 0050 S2): a YubiKey write
-        // is slow, and on a post-quantum store needs a touch, so a burst of
-        // changes makes one save.  The database's own delay, if longer.
-        m_deviceAutosaveFailed = false;
+        // Saved once the changes pause (yb specs 0050 S2, 0051 S1): a burst
+        // of changes makes one save.  The database's own delay, if longer.
         if (config()->get(Config::AutoSaveAfterEveryChange).toBool()) {
-            m_deviceSaveTimer->start(std::max(m_db->metadata()->autosaveDelayMin() * 60 * 1000, kDeviceQuietDelayMs));
+            m_deviceSaveTimer->start(std::max(m_db->metadata()->autosaveDelayMin() * 60 * 1000, kDeviceAfterChangeMs));
         }
         return;
     }
@@ -1967,14 +1969,24 @@ void DatabaseWidget::onAutosaveDelayTimeout()
 /// selection) leaves the content as it was, and is never written.
 void DatabaseWidget::onDeviceSaveDelayTimeout()
 {
-    if (!m_db || isLocked() || !isOnDevice() || !m_db->isModified() || m_deviceAutosaveFailed
-        || !config()->get(Config::AutoSaveAfterEveryChange).toBool()) {
+    const bool asked = std::exchange(m_deviceSaveRequested, false);
+    if (!m_db || isLocked() || !isOnDevice() || !m_db->isModified()) {
         return;
     }
-    // Not in the middle of a dialog (a PIN prompt, a question), a reload
-    // or a save: later.
-    if (QApplication::activeModalWidget() || m_reloading || isSaving()) {
-        m_deviceSaveTimer->start(kDeviceQuietDelayMs);
+    // After a failed automatic save, none until the content changes: the
+    // failure itself marks the vault modified again.
+    const bool automatic = config()->get(Config::AutoSaveAfterEveryChange).toBool()
+                           && (m_deviceFailedContent.isEmpty() || m_db->contentHash() != m_deviceFailedContent);
+    if (!(asked || automatic)) {
+        return;
+    }
+    // Not in the middle of a dialog (a PIN prompt, a question), a reload,
+    // a save, or a YubiKey operation, nor right after one: later.
+    const auto* storage = DeviceStorage::instance();
+    if (QApplication::activeModalWidget() || m_reloading || isSaving() || storage->busy()
+        || storage->msSinceLastOperation() < kDeviceSettleMs) {
+        m_deviceSaveRequested = asked;
+        m_deviceSaveTimer->start(kDeviceSettleMs);
         return;
     }
     if (m_db->deviceContentUnchanged()) {
@@ -1984,12 +1996,27 @@ void DatabaseWidget::onDeviceSaveDelayTimeout()
         return;
     }
     m_deviceSaveTrigger = QStringLiteral("automatic, after the changes paused");
-    if (!save()) {
+    if (save()) {
+        m_deviceFailedContent.clear();
+    } else {
         // Not again until the next change, Save, lock or exit: a refused
         // touch must not become a loop of prompts.
-        m_deviceAutosaveFailed = true;
+        m_deviceFailedContent = m_db->contentHash();
         m_messageWidget->addAction(m_deviceRetry);
     }
+}
+
+/// Save, after 0.25 s without another request (yb spec 0051 S1): Save on a
+/// vault on the YubiKey, so that a burst of saves makes one write.  Other
+/// databases save at once.
+void DatabaseWidget::saveSoon()
+{
+    if (!isOnDevice()) {
+        save();
+        return;
+    }
+    m_deviceSaveRequested = true;
+    m_deviceSaveTimer->start(kDeviceSettleMs);
 }
 
 void DatabaseWidget::triggerAutosaveTimer()

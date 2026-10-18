@@ -83,8 +83,6 @@ private:
     bool restoreDatabase(const QString& filePath, const QString& fromBackupFilePath);
     bool performSave(const QString& filePath, SaveAction flags, const QString& backupFilePath, QString* error);
     bool saveToDevice(const QString& location, QString* error);
-    /// A hash of the content (see deviceContentUnchanged); empty on error.
-    QByteArray contentHash();
     /// The content hash when the vault was last read or saved.
     QByteArray m_deviceContentHash;
 
@@ -101,6 +99,9 @@ public:
     /// it was last read or saved, leaving out what changes without a data
     /// change (yb spec 0047 S2's unchanged-content check).
     bool deviceContentUnchanged();
+    /// A hash of the content, leaving out what changes without a data
+    /// change (see deviceContentUnchanged); empty on error.
+    QByteArray contentHash();
     bool import(const QString& xmlExportPath, QString* error = nullptr);
 
     quint32 formatVersion() const;

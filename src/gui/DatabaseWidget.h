@@ -262,6 +262,7 @@ public slots:
     void showErrorMessage(const QString& errorMessage);
     void hideMessage();
     void triggerAutosaveTimer();
+    void saveSoon();
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -353,8 +354,11 @@ private:
     QString m_deviceSaveTrigger;
     /// A vault on the YubiKey is saved after a quiet delay (yb spec 0050 S2).
     QPointer<QTimer> m_deviceSaveTimer;
-    /// The last automatic save failed: none until the next change.
-    bool m_deviceAutosaveFailed = false;
+    /// The last automatic save failed: none until the content changes
+    /// from this (its normalized hash at the failure).
+    QByteArray m_deviceFailedContent;
+    /// Save was asked for (saveSoon): saved when the timer ends.
+    bool m_deviceSaveRequested = false;
     /// Retry, on the message of a failed automatic save.
     QPointer<QAction> m_deviceRetry;
     bool isOnDevice() const;

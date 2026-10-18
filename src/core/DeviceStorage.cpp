@@ -17,6 +17,9 @@
 
 #include "DeviceStorage.h"
 
+#include <QDateTime>
+#include <limits>
+
 #include "config-keepassx.h"
 
 #include "core/AsyncTask.h"
@@ -1068,6 +1071,18 @@ template <typename F> auto DeviceStorage::offGui(F f) -> decltype(f())
 {
     const auto locked = [&] {
         QMutexLocker lock(&m_mutex);
+        // Every operation counts, for the saves that wait for the YubiKey
+        // to be quiet (yb spec 0051 S1).
+        ++m_running;
+        struct Done
+        {
+            DeviceStorage* storage;
+            ~Done()
+            {
+                storage->m_lastOperationEnd = QDateTime::currentMSecsSinceEpoch();
+                --storage->m_running;
+            }
+        } done{this};
         return f();
     };
     auto* app = QCoreApplication::instance();
@@ -1175,6 +1190,24 @@ void DeviceStorage::setQuitting(bool quitting)
 {
     qCInfo(lcYubiKey) << (quitting ? "quitting: no more reads" : "not quitting after all");
     m_quitting = quitting;
+}
+
+void DeviceStorage::notify(const QString& message)
+{
+    if (m_notice) {
+        onGuiThread([&] { m_notice(message); });
+    }
+}
+
+bool DeviceStorage::busy() const
+{
+    return m_running > 0;
+}
+
+qint64 DeviceStorage::msSinceLastOperation() const
+{
+    const qint64 end = m_lastOperationEnd;
+    return end == 0 ? std::numeric_limits<qint64>::max() : QDateTime::currentMSecsSinceEpoch() - end;
 }
 
 void DeviceStorage::setPin(const QString& serial, const QString& pin)

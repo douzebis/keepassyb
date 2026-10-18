@@ -40,14 +40,15 @@ private slots:
     void testAutoSaveAfterQuietDelay();
     void testNoAutoSaveForViewChanges();
     void testFailedAutoSaveDoesNotRetry();
+    void testYubiKeyOperationPostponesSave();
+    void testSaveRequestsMakeOneWrite();
     void testLockSavesWithoutAsking();
     void testLockAsksWhenAutoSaveOnExitIsOff();
     void testChangedOnTheYubiKeyAsks();
 
 private:
-    void change(const QString& title);
-    void quietDelayEnds();
-    bool savePending() const;
+    void change(const QString& title, bool waitForReport = true);
+    void nothingStoredFor(int ms);
 
     QSharedPointer<Database> m_db;
     QPointer<DatabaseWidget> m_widget;

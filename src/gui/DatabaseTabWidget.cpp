@@ -540,7 +540,14 @@ bool DatabaseTabWidget::saveDatabase(int index)
         index = currentIndex();
     }
 
-    return databaseWidgetFromIndex(index)->save();
+    // A vault on a YubiKey: after 0.25 s without another request (yb spec
+    // 0051 S1).
+    auto* widget = databaseWidgetFromIndex(index);
+    if (DeviceStorage::isDeviceLocation(widget->database()->filePath())) {
+        widget->saveSoon();
+        return true;
+    }
+    return widget->save();
 }
 
 bool DatabaseTabWidget::saveDatabaseAs(int index)

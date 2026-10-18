@@ -28,6 +28,7 @@
 #include <QString>
 #include <QStringList>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 
@@ -250,6 +251,14 @@ public:
     /// (`<vault>.passwd`), if `canRememberPassword`.
     bool storePassword(const QString& location, const QString& password, QString* error);
 
+    /// Tell the user something (the notice set with setNotice).
+    void notify(const QString& message);
+    /// Whether a YubiKey operation is running, and the milliseconds since
+    /// the last one ended (yb spec 0051 S1: no save starts during one, nor
+    /// right after).
+    bool busy() const;
+    qint64 msSinceLastOperation() const;
+
     void setPin(const QString& serial, const QString& pin);
     /// Forget the PIN of a YubiKey, overwriting it in memory.
     void forgetPin(const QString& serial);
@@ -310,6 +319,9 @@ private:
     friend class OpLog;
     /// The operation being timed, if any (operations do not overlap).
     class OpLog* m_op = nullptr;
+    std::atomic<int> m_running{0};
+    /// When the last operation ended (ms since the epoch).
+    std::atomic<qint64> m_lastOperationEnd{0};
 
     std::unique_ptr<Backend> m_backend;
     PinPrompt m_pinPrompt;

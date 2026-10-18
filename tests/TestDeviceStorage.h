@@ -50,6 +50,8 @@ private slots:
     void testSaveIsOneStoreCall();
     void testChangedOnTheYubiKey();
     void testChangeSeenByARefreshIsStillAConflict();
+    void testPaddingOnlyWithKeeShare();
+    void testNoHistoryWhenFirstSavedToAYubiKey();
     void testNothingReachesTheYubiKeyWhenQuitting();
     void testOperationsRunOffTheGuiThread();
     void testProgress();

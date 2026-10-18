@@ -23,8 +23,10 @@
 #include <QTest>
 #include <QThread>
 
+#include "core/CustomData.h"
 #include "core/Database.h"
 #include "core/DeviceStorage.h"
+#include "core/Entry.h"
 #include "core/Group.h"
 #include "core/Metadata.h"
 #include "crypto/Crypto.h"
@@ -708,4 +710,63 @@ void TestDeviceStorage::testChangeSeenByARefreshIsStillAConflict()
     QVERIFY2(error.contains("changed on the YubiKey"), qPrintable(error));
     QCOMPARE(fake->blobs.value("Passwords.kdbx"), onCard);
     QTRY_COMPARE(asked.count(), 1);
+}
+
+/// The written copy has no random padding unless the vault uses KeeShare,
+/// whose size side channel it defends against (yb spec 0051 S2).
+void TestDeviceStorage::testPaddingOnlyWithKeeShare()
+{
+    saveNewDatabase("padding");
+    QString error;
+    auto reopened = [&] {
+        DeviceStorage::instance()->clearCache();
+        auto db = QSharedPointer<Database>::create();
+        db->open(Location, key(), &error);
+        return db;
+    };
+    auto db = reopened();
+    QVERIFY2(db->isInitialized(), qPrintable(error));
+    QVERIFY(!db->metadata()->customData()->contains(CustomData::RandomSlug));
+
+    auto* shared = new Group();
+    shared->setUuid(QUuid::createUuid());
+    shared->setName("shared");
+    shared->setParent(db->rootGroup());
+    shared->customData()->set("KeeShare/Reference", "x");
+    QVERIFY2(db->save(Database::Atomic, {}, &error), qPrintable(error));
+    QVERIFY(reopened()->metadata()->customData()->contains(CustomData::RandomSlug));
+}
+
+/// A vault first saved to a YubiKey keeps no old versions of its entries
+/// (the user is told, and may raise the setting); one already there keeps
+/// its setting (yb spec 0051 S4).
+void TestDeviceStorage::testNoHistoryWhenFirstSavedToAYubiKey()
+{
+    QStringList notices;
+    DeviceStorage::instance()->setNotice([&notices](const QString& message) { notices << message; });
+    auto db = QSharedPointer<Database>::create();
+    auto kdf = KeePass2::uuidToKdf(KeePass2::KDF_ARGON2D);
+    kdf->setRounds(1);
+    kdf->processParameters({{KeePass2::KDFPARAM_ARGON2_MEMORY, 1024}, {KeePass2::KDFPARAM_ARGON2_PARALLELISM, 1}});
+    db->changeKdf(kdf);
+    db->setKey(key());
+    auto* entry = new Entry();
+    entry->setUuid(QUuid::createUuid());
+    entry->setTitle("with history");
+    entry->setGroup(db->rootGroup());
+    entry->addHistoryItem(entry->clone(Entry::CloneNoFlags));
+    QCOMPARE(entry->historyItems().size(), 1);
+
+    QString error;
+    QVERIFY2(db->saveAs(Location, Database::Atomic, {}, &error), qPrintable(error));
+    QCOMPARE(db->metadata()->historyMaxItems(), 0);
+    QVERIFY(entry->historyItems().isEmpty());
+    QCOMPARE(notices.size(), 1);
+    QVERIFY2(notices.first().contains("History"), qPrintable(notices.first()));
+
+    db->metadata()->setHistoryMaxItems(5);
+    QVERIFY2(db->save(Database::Atomic, {}, &error), qPrintable(error));
+    QCOMPARE(db->metadata()->historyMaxItems(), 5);
+    QCOMPARE(notices.size(), 1);
+    DeviceStorage::instance()->setNotice({});
 }

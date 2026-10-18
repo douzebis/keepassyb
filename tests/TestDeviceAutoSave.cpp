@@ -94,48 +94,39 @@ void TestDeviceAutoSave::cleanupTestCase()
     fake = nullptr;
 }
 
-/// A data change: a new entry, once the database has told so (its
-/// `modified` signal comes after a short delay).
-void TestDeviceAutoSave::change(const QString& title)
+/// A data change: a new entry.  `waitForReport`: until the database has
+/// told so (its `modified` signal comes 150 ms after the change).
+void TestDeviceAutoSave::change(const QString& title, bool waitForReport)
 {
     QSignalSpy told(m_db.data(), &Database::modified);
     auto* entry = new Entry();
     entry->setUuid(QUuid::createUuid());
     entry->setTitle(title);
     entry->setGroup(m_db->rootGroup());
-    QTRY_VERIFY(!told.isEmpty());
-}
-
-/// The quiet delay ends (its timer's slot, rather than waiting for it).
-void TestDeviceAutoSave::quietDelayEnds()
-{
-    QVERIFY(QMetaObject::invokeMethod(m_widget, "onDeviceSaveDelayTimeout"));
-}
-
-/// The device save timer is running: at least 10 s, restarted by changes.
-bool TestDeviceAutoSave::savePending() const
-{
-    for (const auto* timer : m_widget->findChildren<QTimer*>()) {
-        if (timer->isActive() && timer->isSingleShot() && timer->interval() >= 10000) {
-            return true;
-        }
+    if (waitForReport) {
+        QTRY_VERIFY(!told.isEmpty());
     }
-    return false;
 }
 
-/// A burst of changes makes one save, once the changes pause (yb spec
-/// 0050 S2).
+/// Wait `ms`, and check that nothing was stored meanwhile.
+void TestDeviceAutoSave::nothingStoredFor(int ms)
+{
+    const auto attempts = fake->storeAttempts;
+    QTest::qWait(ms);
+    QCOMPARE(fake->storeAttempts, attempts);
+}
+
+/// A burst of changes makes one save, about 0.25 s after the last one
+/// (yb spec 0051 S1).
 void TestDeviceAutoSave::testAutoSaveAfterQuietDelay()
 {
     const auto stores = fake->stores;
-    change("one");
-    change("two");
-    change("three");
-    QTRY_VERIFY(savePending());
-    QCOMPARE(fake->stores, stores);
-    quietDelayEnds();
-    QCOMPARE(fake->stores, stores + 1);
+    change("one", false);
+    change("two", false);
+    change("three", false);
+    QTRY_COMPARE_WITH_TIMEOUT(fake->stores, stores + 1, 2000);
     QVERIFY(!m_db->isModified());
+    nothingStoredFor(600);
 }
 
 /// A database marked modified, its content unchanged (a change of view):
@@ -145,10 +136,8 @@ void TestDeviceAutoSave::testNoAutoSaveForViewChanges()
     const auto attempts = fake->storeAttempts;
     m_db->rootGroup()->setExpanded(!m_db->rootGroup()->isExpanded());
     m_db->markAsModified();
-    QTRY_VERIFY(savePending());
-    quietDelayEnds();
+    QTRY_VERIFY_WITH_TIMEOUT(!m_db->isModified(), 2000);
     QCOMPARE(fake->storeAttempts, attempts);
-    QVERIFY(!m_db->isModified());
 }
 
 /// A failed automatic save (a touch refused) is not retried until the
@@ -158,26 +147,52 @@ void TestDeviceAutoSave::testFailedAutoSaveDoesNotRetry()
     fake->locked = DeviceStorage::NoTouch;
     const auto attempts = fake->storeAttempts;
     change("refused");
-    QTRY_VERIFY(savePending());
-    quietDelayEnds();
-    QCOMPARE(fake->storeAttempts, attempts + 1);
+    QTRY_COMPARE_WITH_TIMEOUT(fake->storeAttempts, attempts + 1, 2000);
     QVERIFY(m_db->isModified());
-    quietDelayEnds();
-    QCOMPARE(fake->storeAttempts, attempts + 1);
+    nothingStoredFor(800);
 
     fake->locked = DeviceStorage::Ok;
-    change("accepted");
-    QTRY_VERIFY(savePending());
-    quietDelayEnds();
-    QCOMPARE(fake->storeAttempts, attempts + 2);
-    QVERIFY(!m_db->isModified());
+    change("accepted", false);
+    QTRY_COMPARE_WITH_TIMEOUT(fake->storeAttempts, attempts + 2, 2000);
+    QTRY_VERIFY(!m_db->isModified());
 }
 
-/// Lock with automatic saves on: saved without asking.
+/// A YubiKey operation postpones a pending save until 0.25 s after it
+/// ends (yb spec 0051 S1).
+void TestDeviceAutoSave::testYubiKeyOperationPostponesSave()
+{
+    const auto stores = fake->stores;
+    change("during operations", false);
+    QString error;
+    for (int i = 0; i < 6; ++i) {
+        DeviceStorage::instance()->listVaults({}, &error);
+        QTest::qWait(100);
+        QCOMPARE(fake->stores, stores);
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(fake->stores, stores + 1, 2000);
+}
+
+/// Save, asked several times in a row, makes one write, 0.25 s after the
+/// last request (yb spec 0051 S1).
+void TestDeviceAutoSave::testSaveRequestsMakeOneWrite()
+{
+    config()->set(Config::AutoSaveAfterEveryChange, false);
+    const auto stores = fake->stores;
+    change("asked");
+    for (int i = 0; i < 4; ++i) {
+        m_widget->saveSoon();
+        QTest::qWait(100);
+        QCOMPARE(fake->stores, stores);
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(fake->stores, stores + 1, 2000);
+    nothingStoredFor(600);
+}
+
+/// Lock with automatic saves on: saved at once, without asking.
 void TestDeviceAutoSave::testLockSavesWithoutAsking()
 {
     const auto stores = fake->stores;
-    change("before lock");
+    change("before lock", false);
     // Were a question asked, it would be cancelled, and the lock refused.
     MessageBox::setNextAnswer(MessageBox::Cancel);
     QVERIFY(m_widget->lock());
@@ -191,7 +206,7 @@ void TestDeviceAutoSave::testLockAsksWhenAutoSaveOnExitIsOff()
     config()->set(Config::AutoSaveOnExit, false);
     const auto stores = fake->stores;
     change("before lock");
-    QVERIFY(!savePending());
+    nothingStoredFor(500);
     MessageBox::setNextAnswer(MessageBox::Save);
     QVERIFY(m_widget->lock());
     QCOMPARE(fake->stores, stores + 1);
@@ -215,11 +230,8 @@ void TestDeviceAutoSave::testChangedOnTheYubiKeyAsks()
     const auto stores = fake->stores;
     const auto onCard = fake->blobs.value("Passwords.kdbx");
 
-    change("mine");
-    QTRY_VERIFY(savePending());
     MessageBox::setNextAnswer(MessageBox::Overwrite);
-    quietDelayEnds();
-    QCOMPARE(fake->blobs.value("Passwords.kdbx"), onCard);
-    QTRY_COMPARE(fake->stores, stores + 1);
+    change("mine");
+    QTRY_COMPARE_WITH_TIMEOUT(fake->stores, stores + 1, 3000);
     QVERIFY(fake->blobs.value("Passwords.kdbx") != onCard);
 }
