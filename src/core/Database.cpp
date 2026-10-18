@@ -393,12 +393,37 @@ bool Database::saveAs(const QString& filePath, SaveAction action, const QString&
  */
 bool Database::saveToDevice(const QString& location, QString* error)
 {
+    // A vault changed on the YubiKey since this database read or saved it
+    // is not overwritten, unless the user chose to (yb spec 0050 S3).  As
+    // for a file: the version on the YubiKey, as KeePassYB last saw it,
+    // must still be the one this database is based on (its first block's
+    // hash); and the YubiKey must not have changed since (IF_UNCHANGED).
+    const bool ifUnchanged = !m_ignoreFileChangesUntilSaved && location == m_data.filePath;
+    if (ifUnchanged && !m_fileBlockHash.isEmpty()) {
+        QByteArray current;
+        QString ignored;
+        // Without the PIN: the vault as last seen, from the snapshot.
+        if (DeviceStorage::instance()->read(location, &current, &ignored, false)
+            && current.size() >= kFileBlockToHashSizeBytes
+            && QCryptographicHash::hash(current.left(kFileBlockToHashSizeBytes), QCryptographicHash::Md5)
+                   != m_fileBlockHash) {
+            if (error) {
+                *error = tr("%1 was changed on the YubiKey since it was opened: nothing was written.")
+                             .arg(location.section('/', -1));
+            }
+            QMetaObject::invokeMethod(this, "databaseFileChanged", Qt::QueuedConnection, Q_ARG(bool, true));
+            markAsModified();
+            return false;
+        }
+    }
+
     // Add random data to prevent side-channel data deduplication attacks
     int length = Random::instance()->randomUIntRange(64, 512);
     m_metadata->customData()->set(CustomData::RandomSlug, Random::instance()->randomArray(length).toHex());
 
     QMutexLocker locker(&m_saveMutex);
 
+    bool changed = false;
     bool ok = AsyncTask::runAndWaitForFuture([&] {
         QBuffer dbBuffer;
         dbBuffer.open(QIODevice::WriteOnly);
@@ -413,10 +438,12 @@ bool Database::saveToDevice(const QString& location, QString* error)
             return false;
         }
         QString deviceError;
-        if (!DeviceStorage::instance()->write(location, dbBuffer.data(), &deviceError)) {
+        DeviceStorage::Status status;
+        if (!DeviceStorage::instance()->write(location, dbBuffer.data(), &deviceError, &status, ifUnchanged)) {
             if (error) {
                 *error = deviceError;
             }
+            changed = status == DeviceStorage::Changed;
             return false;
         }
         m_fileBlockHash = hashingStream.hashingResult();
@@ -425,9 +452,15 @@ bool Database::saveToDevice(const QString& location, QString* error)
     if (ok) {
         setFilePath(location);
         markAsClean();
+        m_ignoreFileChangesUntilSaved = false;
         m_deviceContentHash = contentHash();
     } else {
         markAsModified();
+    }
+    if (changed) {
+        // As for a file changed on disk: merge, overwrite or discard.  Once
+        // this save is over (the wait above runs an event loop).
+        QMetaObject::invokeMethod(this, "databaseFileChanged", Qt::QueuedConnection, Q_ARG(bool, true));
     }
     return ok;
 }

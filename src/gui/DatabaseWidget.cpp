@@ -73,6 +73,13 @@
 #include "gui/passkeys/PasskeyImporter.h"
 #endif
 
+namespace
+{
+    /// The least time without a change before a vault on the YubiKey is
+    /// saved (yb spec 0050 S2).
+    constexpr int kDeviceQuietDelayMs = 10000;
+} // namespace
+
 DatabaseWidget::DatabaseWidget(QSharedPointer<Database> db, QWidget* parent)
     : QStackedWidget(parent)
     , m_db(std::move(db))
@@ -233,6 +240,15 @@ DatabaseWidget::DatabaseWidget(QSharedPointer<Database> db, QWidget* parent)
     m_autosaveTimer = new QTimer(this);
     m_autosaveTimer->setSingleShot(true);
     connect(m_autosaveTimer, SIGNAL(timeout()), this, SLOT(onAutosaveDelayTimeout()));
+
+    m_deviceSaveTimer = new QTimer(this);
+    m_deviceSaveTimer->setSingleShot(true);
+    connect(m_deviceSaveTimer, &QTimer::timeout, this, &DatabaseWidget::onDeviceSaveDelayTimeout);
+    m_deviceRetry = new QAction(tr("Retry"), this);
+    connect(m_deviceRetry, &QAction::triggered, this, [this] {
+        m_deviceSaveTrigger = QStringLiteral("automatic save (Retry)");
+        save();
+    });
 
     m_searchLimitGroup = config()->get(Config::SearchLimitGroup).toBool();
 
@@ -1906,8 +1922,13 @@ void DatabaseWidget::onDatabaseModified()
     refreshSearch();
     m_remoteSettings->loadSettings();
     if (isOnDevice()) {
-        // Explicit saves only (yb spec 0047 S3): a YubiKey write is slow,
-        // wears the YubiKey, and on a post-quantum store needs a touch.
+        // Saved once the changes pause (yb spec 0050 S2): a YubiKey write
+        // is slow, and on a post-quantum store needs a touch, so a burst of
+        // changes makes one save.  The database's own delay, if longer.
+        m_deviceAutosaveFailed = false;
+        if (config()->get(Config::AutoSaveAfterEveryChange).toBool()) {
+            m_deviceSaveTimer->start(std::max(m_db->metadata()->autosaveDelayMin() * 60 * 1000, kDeviceQuietDelayMs));
+        }
         return;
     }
     int autosaveDelayMs = m_db->metadata()->autosaveDelayMin() * 60 * 1000; // min to msec for QTimer
@@ -1938,6 +1959,36 @@ void DatabaseWidget::onAutosaveDelayTimeout()
     } else {
         // Only block once, then reset
         m_blockAutoSave = false;
+    }
+}
+
+/// The changes to a vault on the YubiKey have paused (yb spec 0050 S2): save
+/// it, if its content changed.  A change of view (an expanded group, a
+/// selection) leaves the content as it was, and is never written.
+void DatabaseWidget::onDeviceSaveDelayTimeout()
+{
+    if (!m_db || isLocked() || !isOnDevice() || !m_db->isModified() || m_deviceAutosaveFailed
+        || !config()->get(Config::AutoSaveAfterEveryChange).toBool()) {
+        return;
+    }
+    // Not in the middle of a dialog (a PIN prompt, a question), a reload
+    // or a save: later.
+    if (QApplication::activeModalWidget() || m_reloading || isSaving()) {
+        m_deviceSaveTimer->start(kDeviceQuietDelayMs);
+        return;
+    }
+    if (m_db->deviceContentUnchanged()) {
+        qCInfo(lcYubiKey).noquote()
+            << QString("automatic save: %1 unchanged in content: not saved").arg(m_db->filePath());
+        m_db->markAsClean();
+        return;
+    }
+    m_deviceSaveTrigger = QStringLiteral("automatic, after the changes paused");
+    if (!save()) {
+        // Not again until the next change, Save, lock or exit: a refused
+        // touch must not become a loop of prompts.
+        m_deviceAutosaveFailed = true;
+        m_messageWidget->addAction(m_deviceRetry);
     }
 }
 
@@ -2148,11 +2199,21 @@ bool DatabaseWidget::lock()
     if (m_db->isModified()) {
         bool saved = false;
         // Attempt to save on exit, but don't block locking if it fails.  A
-        // database on a device is saved only when asked (yb spec 0047 S3).
-        if (!isOnDevice()
-            && (config()->get(Config::AutoSaveOnExit).toBool()
-                || config()->get(Config::AutoSaveAfterEveryChange).toBool())) {
+        // vault on the YubiKey too (yb spec 0050 S2); if that fails, its
+        // user chooses (Retry, a file, Discard, Cancel).
+        if (config()->get(Config::AutoSaveOnExit).toBool()
+            || config()->get(Config::AutoSaveAfterEveryChange).toBool()) {
+            if (isOnDevice()) {
+                m_deviceSaveTrigger = QStringLiteral("lock, close or exit (automatic)");
+            }
             saved = save();
+            if (!saved && isOnDevice()) {
+                if (!resolveFailedDeviceSave()) {
+                    m_attemptingLock = false;
+                    return false;
+                }
+                saved = true;
+            }
 
             if (!saved) {
                 // detect if a reload was triggered
@@ -2594,6 +2655,8 @@ bool DatabaseWidget::save()
     }
 
     if (isOnDevice()) {
+        m_deviceSaveTimer->stop();
+        m_messageWidget->removeAction(m_deviceRetry);
         qCInfo(lcYubiKey).noquote() << QString("save: %1, trigger %2, modified %3, non-data changes %4")
                                            .arg(m_db->filePath(),
                                                 m_deviceSaveTrigger.isEmpty() ? QStringLiteral("Save")
@@ -2713,6 +2776,8 @@ bool DatabaseWidget::chooseSaveLocation(QString* location)
     location->clear();
     QString error;
     DeviceStorage::Status status;
+    // The YubiKey as it is now (yb spec 0050 S1).
+    DeviceStorage::instance()->refresh({});
     auto vaults = DeviceStorage::instance()->listVaults({}, &error, &status);
     const bool severalYubiKeys = status == DeviceStorage::SeveralDevices;
     if (!error.isEmpty() && !severalYubiKeys) {
@@ -2754,6 +2819,7 @@ bool DatabaseWidget::chooseSaveLocation(QString* location)
         if (!ok || serial.isEmpty()) {
             return false;
         }
+        DeviceStorage::instance()->refresh(serial);
         vaults = DeviceStorage::instance()->listVaults(serial, &error);
         if (!error.isEmpty()) {
             showMessage(error, MessageWidget::Error);

@@ -282,6 +282,7 @@ private slots:
     void onDatabaseModified();
     void onDatabaseNonDataChanged();
     void onAutosaveDelayTimeout();
+    void onDeviceSaveDelayTimeout();
     void connectDatabaseSignals();
     void loadDatabase(bool accepted);
     void unlockDatabase(bool accepted);
@@ -350,6 +351,12 @@ private:
     /// What triggered the next save of a vault on the YubiKey, for its log
     /// (yb spec 0047 S1); empty: Save.
     QString m_deviceSaveTrigger;
+    /// A vault on the YubiKey is saved after a quiet delay (yb spec 0050 S2).
+    QPointer<QTimer> m_deviceSaveTimer;
+    /// The last automatic save failed: none until the next change.
+    bool m_deviceAutosaveFailed = false;
+    /// Retry, on the message of a failed automatic save.
+    QPointer<QAction> m_deviceRetry;
     bool isOnDevice() const;
     bool resolveFailedDeviceSave();
     bool chooseSaveLocation(QString* location);

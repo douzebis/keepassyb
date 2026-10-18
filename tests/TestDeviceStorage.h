@@ -45,8 +45,11 @@ private slots:
     void testLockedYubiKeyFallback();
     void testLegacyVaultOpensWithLockedYubiKey();
     void testRememberPassword();
-    void testOneListingPerAction();
-    void testListingIsDroppedAfterAWriteAndExpires();
+    void testOneReadToOpen();
+    void testSnapshotUntilRefresh();
+    void testSaveIsOneStoreCall();
+    void testChangedOnTheYubiKey();
+    void testChangeSeenByARefreshIsStillAConflict();
     void testNothingReachesTheYubiKeyWhenQuitting();
     void testOperationsRunOffTheGuiThread();
     void testProgress();

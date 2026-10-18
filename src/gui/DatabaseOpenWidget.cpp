@@ -250,7 +250,13 @@ void DatabaseOpenWidget::load(const QString& filename)
 
     m_filename = filename;
 
-    // Read public headers
+    // Read public headers.  A vault on the YubiKey: the YubiKey as it is
+    // now, read once, which serves the dialog and the unlock (yb spec 0050
+    // S1).
+    QString serial, blob;
+    if (DeviceStorage::parse(m_filename, &serial, &blob)) {
+        DeviceStorage::instance()->refresh(serial);
+    }
     QString error;
     m_db.reset(new Database());
     m_db->open(m_filename, nullptr, &error);

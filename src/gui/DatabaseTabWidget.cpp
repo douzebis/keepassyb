@@ -142,6 +142,8 @@ void DatabaseTabWidget::openDatabase()
     // file; otherwise, as always, the file dialog.
     QString error;
     DeviceStorage::Status status;
+    // The YubiKey as it is now (yb spec 0050 S1).
+    DeviceStorage::instance()->refresh({});
     const auto vaults = DeviceStorage::instance()->listVaults({}, &error, &status);
     const bool severalYubiKeys = status == DeviceStorage::SeveralDevices;
     if (!error.isEmpty() && !severalYubiKeys) {
@@ -251,6 +253,7 @@ void DatabaseTabWidget::openDatabaseFromOtherDevice()
         return;
     }
     QString error;
+    DeviceStorage::instance()->refresh(serial);
     const auto vaults = DeviceStorage::instance()->listVaults(serial, &error);
     if (!error.isEmpty()) {
         emit messageGlobal(error, MessageWidget::Error);

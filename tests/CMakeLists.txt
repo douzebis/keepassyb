@@ -157,6 +157,9 @@ add_unit_test(NAME testdatabase SOURCES TestDatabase.cpp
 add_unit_test(NAME testdevicestorage SOURCES TestDeviceStorage.cpp
         LIBS testsupport ${TEST_LIBRARIES})
 
+add_unit_test(NAME testdeviceautosave SOURCES TestDeviceAutoSave.cpp util/TemporaryFile.cpp
+        LIBS testsupport ${TEST_LIBRARIES})
+
 add_unit_test(NAME testkeepassyb SOURCES TestKeePassYB.cpp
         LIBS ${TEST_LIBRARIES})
 

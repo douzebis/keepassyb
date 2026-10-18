@@ -51,8 +51,14 @@
  * needs the FIDO2 PIN and a touch, and when the YubiKey is locked, it can be
  * read with its checksum only, if the user agrees (yb spec 0044).
  *
- * Reads are served from a cache of the bytes, checked against the device
- * without the PIN; writes go to the device at once (write-through).
+ * The YubiKey is read once per action that needs it fresh (yb spec 0050):
+ * libyubiblob's snapshot session per YubiKey answers the questions (the
+ * listing, the store's kind, reads without the PIN) until `refresh`, which
+ * the "Open from YubiKey" and unlock dialogs call when they open.  A write
+ * reads the store again anyway (under the card lock, yb spec 0048), and a
+ * vault's save fails with `Changed`, writing nothing, if the vault changed
+ * on the YubiKey since (yb spec 0049).  Bytes read with the PIN are kept,
+ * and reused while the device's listing shows the same vault.
  */
 /// KeePassYB's YubiKey log (yb spec 0047 S1), off by default:
 /// QT_LOGGING_RULES="keepassyb.yubikey=true" (info level, as KeePassXC
@@ -93,6 +99,9 @@ public:
         NoFido2Access = 19,
         /// A read without PIN of an encrypted blob (yb spec 0044).
         Encrypted = 20,
+        /// A write with `ifUnchanged`: the blob changed on the YubiKey
+        /// since the snapshot; nothing was written (yb spec 0049).
+        Changed = 21,
         /// KeePassXC built without libyubiblob.
         NotAvailable = -1,
     };
@@ -120,10 +129,16 @@ public:
     /// The device side: libyubiblob, or a stand-in in tests.  `serial` is
     /// empty for the only YubiKey connected.  On failure, `error` says why
     /// (for people) and `pinTries`, after a wrong PIN, the tries left.
+    ///
+    /// A snapshot per YubiKey (yb spec 0049): `list`, `storeKind` and
+    /// `fetchUnencrypted` answer from the store as last read; `refresh`
+    /// reads it again; `store` and `remove` read it under the card lock,
+    /// and leave the snapshot up to date.
     class Backend
     {
     public:
         virtual ~Backend() = default;
+        virtual Status refresh(const QString& serial, QString* error) = 0;
         virtual Status list(const QString& serial, QList<BlobInfo>* blobs, QString* error) = 0;
         virtual Status storeKind(const QString& serial, StoreKind* kind, QString* error) = 0;
         virtual Status fetch(const QString& serial,
@@ -136,10 +151,13 @@ public:
         /// check its signature, post-quantum stores its checksum only.
         virtual Status
         fetchUnencrypted(const QString& serial, const QString& name, QByteArray* data, QString* error) = 0;
+        /// `ifUnchanged`: fail with `Changed`, writing nothing, if the blob
+        /// changed on the YubiKey since the snapshot.
         virtual Status store(const QString& serial,
                              const QString& name,
                              const QByteArray& data,
                              bool encrypt,
+                             bool ifUnchanged,
                              const QByteArray& pin,
                              QString* error,
                              int* pinTries) = 0;
@@ -185,8 +203,17 @@ public:
     /// reading only the public headers, e.g. restoring tabs at start-up),
     /// nothing is fetched unless the PIN is already known.
     bool read(const QString& location, QByteArray* data, QString* error, bool mayAskPin = true);
-    /// Store `data` on the device (with the PIN); updates the cache.
-    bool write(const QString& location, const QByteArray& data, QString* error);
+    /// Store `data` on the device (with the PIN); updates the cache.  With
+    /// `ifUnchanged`, a vault changed on the YubiKey since it was read
+    /// fails with `Changed` in `status`, writing nothing (yb spec 0050 S3).
+    bool write(const QString& location,
+               const QByteArray& data,
+               QString* error,
+               Status* status = nullptr,
+               bool ifUnchanged = false);
+    /// Read the YubiKey's store again (yb spec 0050 S1): when a dialog
+    /// opens that should show it as it is now.
+    bool refresh(const QString& serial, QString* error = nullptr);
 
     /// The vaults (`*.kdbx` blobs) on a YubiKey; no PIN needed.  On
     /// failure, `error` is set, and `status` says why.
@@ -237,8 +264,6 @@ public:
     /// KeePassYB is quitting: reads and status questions no longer reach
     /// the YubiKey (writes still do, for a save asked at exit).
     void setQuitting(bool quitting);
-    /// How long a YubiKey listing is reused, in ms (tests).
-    void setListingLifetime(int ms);
     /// Drop cached bytes (tests).
     void clearCache();
 
@@ -256,13 +281,13 @@ private:
     bool pinFor(const QString& serial, StoreKind kind, QByteArray* pin, QString* error);
     bool kindOf(const QString& serial, StoreKind* kind, QString* error);
     bool listing(const QString& serial, QList<BlobInfo>* blobs, Status* status, QString* error);
-    void dropListing(const QString& serial);
+    bool refreshImpl(const QString& serial, QString* error);
     /// Run `f` off the GUI thread (the GUI keeps processing events), one
     /// operation at a time (yb spec 0047 S2).
     template <typename F> auto offGui(F f) -> decltype(f());
 
     bool readImpl(const QString& location, QByteArray* data, QString* error, bool mayAskPin);
-    bool writeImpl(const QString& location, const QByteArray& data, QString* error);
+    bool writeImpl(const QString& location, const QByteArray& data, QString* error, Status* status, bool ifUnchanged);
     QStringList listVaultsImpl(const QString& serial, QString* error, Status* status);
     bool readPasswordImpl(const QString& location, QString* password, QString* error);
     bool hasStoredPasswordImpl(const QString& location);
@@ -293,14 +318,6 @@ private:
     /// Locations already told they are now stored unencrypted.
     QSet<QString> m_toldUnencrypted;
 
-    struct Listing
-    {
-        QList<BlobInfo> blobs;
-        QElapsedTimer age;
-    };
-    QHash<QString, Listing> m_listings;
-    QHash<QString, StoreKind> m_kinds;
-    int m_listingLifetimeMs = 3000;
     bool m_quitting = false;
     /// One operation at a time; recursive, as operations call each other.
     QRecursiveMutex m_mutex;

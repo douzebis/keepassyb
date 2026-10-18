@@ -156,11 +156,13 @@ namespace
                       && DeviceStorage::Internal == YUBIBLOB_ERR_INTERNAL
                       && DeviceStorage::Tampered == YUBIBLOB_ERR_TAMPERED
                       && DeviceStorage::NoFido2Access == YUBIBLOB_ERR_NO_FIDO2_ACCESS
-                      && DeviceStorage::Encrypted == YUBIBLOB_ERR_ENCRYPTED,
+                      && DeviceStorage::Encrypted == YUBIBLOB_ERR_ENCRYPTED
+                      && DeviceStorage::Changed == YUBIBLOB_ERR_CHANGED,
                   "DeviceStorage::Status mirrors libyubiblob's status codes");
 
-    /// The device side on libyubiblob: one session per operation, so that a
-    /// YubiKey unplugged and plugged back in between is simply found again.
+    /// The device side on libyubiblob: a snapshot session per YubiKey,
+    /// kept while it answers (yb spec 0050 S1); closed when the YubiKey is
+    /// gone, so that one plugged back in is simply found again.
     class YubiblobBackend : public DeviceStorage::Backend
     {
     public:
@@ -170,17 +172,35 @@ namespace
             m_compatible = yubiblob_abi_version() == YUBIBLOB_ABI_VERSION;
         }
 
+        ~YubiblobBackend() override
+        {
+            for (auto* handle : std::as_const(m_sessions)) {
+                yubiblob_close(handle);
+            }
+        }
+
+        DeviceStorage::Status refresh(const QString& serial, QString* error) override
+        {
+            auto known = m_sessions.constFind(serial);
+            if (known == m_sessions.constEnd()) {
+                // A new session reads the store.
+                yubiblob_session_t* handle = nullptr;
+                return session(serial, &handle, error);
+            }
+            return done(serial, check(yubiblob_refresh(*known), error));
+        }
+
         DeviceStorage::Status
         list(const QString& serial, QList<DeviceStorage::BlobInfo>* blobs, QString* error) override
         {
-            Session s;
-            auto status = open(serial, &s, error);
+            yubiblob_session_t* handle = nullptr;
+            auto status = session(serial, &handle, error);
             if (status != DeviceStorage::Ok) {
                 return status;
             }
             yubiblob_blob_info_t* found = nullptr;
             size_t count = 0;
-            status = check(yubiblob_list(s.handle, &found, &count), error);
+            status = done(serial, check(yubiblob_list(handle, &found, &count), error));
             if (status != DeviceStorage::Ok) {
                 return status;
             }
@@ -195,13 +215,13 @@ namespace
 
         DeviceStorage::Status storeKind(const QString& serial, DeviceStorage::StoreKind* kind, QString* error) override
         {
-            Session s;
-            auto status = open(serial, &s, error);
+            yubiblob_session_t* handle = nullptr;
+            auto status = session(serial, &handle, error);
             if (status != DeviceStorage::Ok) {
                 return status;
             }
             yubiblob_store_info_t info{};
-            status = check(yubiblob_store_info(s.handle, &info), error);
+            status = done(serial, check(yubiblob_store_info(handle, &info), error));
             if (status == DeviceStorage::Ok) {
                 *kind = info.kind == YUBIBLOB_KIND_POST_QUANTUM ? DeviceStorage::StoreKind::PostQuantum
                                                                 : DeviceStorage::StoreKind::Legacy;
@@ -216,22 +236,23 @@ namespace
                                     QString* error,
                                     int* pinTries) override
         {
-            Session s;
-            auto status = open(serial, &s, error);
+            yubiblob_session_t* handle = nullptr;
+            auto status = session(serial, &handle, error);
             if (status != DeviceStorage::Ok) {
                 return status;
             }
             uint8_t* content = nullptr;
             size_t len = 0;
             const auto blob = name.toUtf8();
-            status = check(yubiblob_fetch(s.handle,
-                                          blob.constData(),
-                                          reinterpret_cast<const uint8_t*>(pin.constData()),
-                                          static_cast<size_t>(pin.size()),
-                                          &content,
-                                          &len),
-                           error,
-                           pinTries);
+            status = done(serial,
+                          check(yubiblob_fetch(handle,
+                                               blob.constData(),
+                                               reinterpret_cast<const uint8_t*>(pin.constData()),
+                                               static_cast<size_t>(pin.size()),
+                                               &content,
+                                               &len),
+                                error,
+                                pinTries));
             if (status == DeviceStorage::Ok) {
                 *data = QByteArray(reinterpret_cast<const char*>(content), static_cast<qsizetype>(len));
                 yubiblob_buffer_free(content, len);
@@ -242,8 +263,8 @@ namespace
         DeviceStorage::Status
         fetchUnencrypted(const QString& serial, const QString& name, QByteArray* data, QString* error) override
         {
-            Session s;
-            auto status = open(serial, &s, error);
+            yubiblob_session_t* handle = nullptr;
+            auto status = session(serial, &handle, error);
             if (status != DeviceStorage::Ok) {
                 return status;
             }
@@ -251,7 +272,8 @@ namespace
             size_t len = 0;
             yubiblob_signature_t verdict{};
             const auto blob = name.toUtf8();
-            status = check(yubiblob_fetch_unencrypted(s.handle, blob.constData(), &content, &len, &verdict), error);
+            status = done(serial,
+                          check(yubiblob_fetch_unencrypted(handle, blob.constData(), &content, &len, &verdict), error));
             if (status == DeviceStorage::Ok) {
                 *data = QByteArray(reinterpret_cast<const char*>(content), static_cast<qsizetype>(len));
                 yubiblob_buffer_free(content, len);
@@ -263,25 +285,29 @@ namespace
                                     const QString& name,
                                     const QByteArray& data,
                                     bool encrypt,
+                                    bool ifUnchanged,
                                     const QByteArray& pin,
                                     QString* error,
                                     int* pinTries) override
         {
-            Session s;
-            auto status = open(serial, &s, error);
+            yubiblob_session_t* handle = nullptr;
+            auto status = session(serial, &handle, error);
             if (status != DeviceStorage::Ok) {
                 return status;
             }
             const auto blob = name.toUtf8();
-            return check(yubiblob_store(s.handle,
-                                        blob.constData(),
-                                        reinterpret_cast<const uint8_t*>(data.constData()),
-                                        static_cast<size_t>(data.size()),
-                                        encrypt ? YUBIBLOB_STORE_ENCRYPT : 0,
-                                        reinterpret_cast<const uint8_t*>(pin.constData()),
-                                        static_cast<size_t>(pin.size())),
-                         error,
-                         pinTries);
+            const uint32_t flags =
+                (encrypt ? YUBIBLOB_STORE_ENCRYPT : 0) | (ifUnchanged ? YUBIBLOB_STORE_IF_UNCHANGED : 0);
+            return done(serial,
+                        check(yubiblob_store(handle,
+                                             blob.constData(),
+                                             reinterpret_cast<const uint8_t*>(data.constData()),
+                                             static_cast<size_t>(data.size()),
+                                             flags,
+                                             reinterpret_cast<const uint8_t*>(pin.constData()),
+                                             static_cast<size_t>(pin.size())),
+                              error,
+                              pinTries));
         }
 
         DeviceStorage::Status remove(const QString& serial,
@@ -290,30 +316,23 @@ namespace
                                      QString* error,
                                      int* pinTries) override
         {
-            Session s;
-            auto status = open(serial, &s, error);
+            yubiblob_session_t* handle = nullptr;
+            auto status = session(serial, &handle, error);
             if (status != DeviceStorage::Ok) {
                 return status;
             }
             const auto blob = name.toUtf8();
-            return check(yubiblob_remove(s.handle,
-                                         blob.constData(),
-                                         reinterpret_cast<const uint8_t*>(pin.constData()),
-                                         static_cast<size_t>(pin.size())),
-                         error,
-                         pinTries);
+            return done(serial,
+                        check(yubiblob_remove(handle,
+                                              blob.constData(),
+                                              0,
+                                              reinterpret_cast<const uint8_t*>(pin.constData()),
+                                              static_cast<size_t>(pin.size())),
+                              error,
+                              pinTries));
         }
 
     private:
-        struct Session
-        {
-            yubiblob_session_t* handle = nullptr;
-            ~Session()
-            {
-                yubiblob_close(handle);
-            }
-        };
-
         static void touched(void* user)
         {
             auto* self = static_cast<YubiblobBackend*>(user);
@@ -322,16 +341,37 @@ namespace
             }
         }
 
-        DeviceStorage::Status open(const QString& serial, Session* s, QString* error)
+        /// The YubiKey's snapshot session, opened (which reads the store)
+        /// if there is none.
+        DeviceStorage::Status session(const QString& serial, yubiblob_session_t** handle, QString* error)
         {
             if (!m_compatible) {
                 *error = tr("This libyubiblob (%1) is not the version KeePassYB was built with.")
                              .arg(QString::fromUtf8(yubiblob_version()));
                 return DeviceStorage::NotAvailable;
             }
-            auto status = check(yubiblob_open(serial.toUInt(), 0, &s->handle), error);
+            if (auto known = m_sessions.constFind(serial); known != m_sessions.constEnd()) {
+                *handle = *known;
+                return DeviceStorage::Ok;
+            }
+            auto status = check(yubiblob_open(serial.toUInt(), YUBIBLOB_OPEN_SNAPSHOT, handle), error);
             if (status == DeviceStorage::Ok) {
-                yubiblob_set_touch_callback(s->handle, &YubiblobBackend::touched, this);
+                yubiblob_set_touch_callback(*handle, &YubiblobBackend::touched, this);
+                m_sessions.insert(serial, *handle);
+            }
+            return status;
+        }
+
+        /// After a call: a session whose YubiKey is gone (or changed) is
+        /// closed; the next call opens a new one.
+        DeviceStorage::Status done(const QString& serial, DeviceStorage::Status status)
+        {
+            if (status == DeviceStorage::NoDevice || status == DeviceStorage::CardRemoved
+                || status == DeviceStorage::NoStore || status == DeviceStorage::SeveralDevices) {
+                if (auto it = m_sessions.find(serial); it != m_sessions.end()) {
+                    yubiblob_close(*it);
+                    m_sessions.erase(it);
+                }
             }
             return status;
         }
@@ -348,12 +388,18 @@ namespace
         }
 
         bool m_compatible = false;
+        /// Snapshot sessions by serial (empty: the only YubiKey).
+        QHash<QString, yubiblob_session_t*> m_sessions;
     };
 #else
     /// Built without libyubiblob: every operation says so.
     class UnavailableBackend : public DeviceStorage::Backend
     {
     public:
+        DeviceStorage::Status refresh(const QString&, QString* error) override
+        {
+            return unavailable(error);
+        }
         DeviceStorage::Status list(const QString&, QList<DeviceStorage::BlobInfo>*, QString* error) override
         {
             return unavailable(error);
@@ -372,7 +418,8 @@ namespace
             return unavailable(error);
         }
         DeviceStorage::Status
-        store(const QString&, const QString&, const QByteArray&, bool, const QByteArray&, QString* error, int*) override
+        store(const QString&, const QString&, const QByteArray&, bool, bool, const QByteArray&, QString* error, int*)
+            override
         {
             return unavailable(error);
         }
@@ -541,12 +588,7 @@ bool DeviceStorage::pinFor(const QString& serial, StoreKind kind, QByteArray* pi
 
 bool DeviceStorage::kindOf(const QString& serial, StoreKind* kind, QString* error)
 {
-    // Only a reformat changes a store's kind: kept for the whole run.
-    auto known = m_kinds.constFind(serial);
-    if (known != m_kinds.constEnd()) {
-        *kind = *known;
-        return true;
-    }
+    // From the snapshot (yb spec 0050 S1).
     QString detail;
     QElapsedTimer asked;
     asked.start();
@@ -556,41 +598,38 @@ bool DeviceStorage::kindOf(const QString& serial, StoreKind* kind, QString* erro
         *error = describe(status, detail, {}, -1, StoreKind::Legacy);
         return false;
     }
-    m_kinds.insert(serial, *kind);
     return true;
 }
 
 bool DeviceStorage::listing(const QString& serial, QList<BlobInfo>* blobs, Status* status, QString* error)
 {
-    // One YubiKey query per user action (yb spec 0047 S2): reused for a few
-    // seconds, dropped after KeePassYB's own writes.
-    auto cached = m_listings.constFind(serial);
-    if (cached != m_listings.constEnd() && cached->age.elapsed() < m_listingLifetimeMs) {
-        *blobs = cached->blobs;
-        *status = Ok;
-        return true;
-    }
+    // From the snapshot (yb spec 0050 S1).
     QString detail;
     QElapsedTimer listed;
     listed.start();
     *status = m_backend->list(serial, blobs, &detail);
     qCInfo(lcYubiKey).noquote() << QString("list: status %1 in %2 ms").arg(*status).arg(listed.elapsed());
     if (*status != Ok) {
-        m_listings.remove(serial);
-        m_kinds.remove(serial);
         *error = describe(*status, detail, {}, -1, StoreKind::Legacy);
         return false;
     }
-    Listing fresh;
-    fresh.blobs = *blobs;
-    fresh.age.start();
-    m_listings.insert(serial, fresh);
     return true;
 }
 
-void DeviceStorage::dropListing(const QString& serial)
+bool DeviceStorage::refreshImpl(const QString& serial, QString* error)
 {
-    m_listings.remove(serial);
+    QString detail;
+    QElapsedTimer asked;
+    asked.start();
+    const auto status = m_backend->refresh(serial, &detail);
+    qCInfo(lcYubiKey).noquote() << QString("refresh: status %1 in %2 ms").arg(status).arg(asked.elapsed());
+    if (status != Ok) {
+        if (error) {
+            *error = describe(status, detail, {}, -1, StoreKind::Legacy);
+        }
+        return false;
+    }
+    return true;
 }
 
 bool DeviceStorage::find(const QString& serial, const QString& blob, BlobInfo* info, Status* status, QString* error)
@@ -673,7 +712,10 @@ bool DeviceStorage::readImpl(const QString& location, QByteArray* data, QString*
     BlobInfo info;
     Status status;
     if (!find(serial, blob, &info, &status, error)) {
-        return false;
+        // Perhaps stored since the snapshot: look again (yb spec 0050 S1).
+        if (status != NotFound || !refreshImpl(serial, nullptr) || !find(serial, blob, &info, &status, error)) {
+            return false;
+        }
     }
     const auto current = QByteArray::number(info.generation) + ":" + QByteArray::number(info.size);
     auto cached = m_cache.constFind(location);
@@ -745,8 +787,15 @@ bool DeviceStorage::readImpl(const QString& location, QByteArray* data, QString*
     return true;
 }
 
-bool DeviceStorage::writeImpl(const QString& location, const QByteArray& data, QString* error)
+bool DeviceStorage::writeImpl(const QString& location,
+                              const QByteArray& data,
+                              QString* error,
+                              Status* result,
+                              bool ifUnchanged)
 {
+    if (result) {
+        *result = Internal;
+    }
     QString serial, blob;
     if (!parse(location, &serial, &blob)) {
         *error = tr("Not a device location: %1").arg(location);
@@ -771,16 +820,23 @@ bool DeviceStorage::writeImpl(const QString& location, const QByteArray& data, Q
     int tries = -1;
     // Unencrypted: the vault is encrypted by its master key, and a locked
     // YubiKey must not lock the user out of it.
-    status = m_backend->store(serial, blob, data, false, pin, &detail, &tries);
+    status = m_backend->store(serial, blob, data, false, ifUnchanged, pin, &detail, &tries);
     pin.fill('\0');
+    if (result) {
+        *result = status;
+    }
     if (status != Ok) {
         if (status == WrongPin || status == PinBlocked || status == Replug || status == FewPinAttempts) {
             forgetPin(serial);
         }
-        *error = describe(status, detail, blob, tries, kind);
+        if (status == Changed) {
+            *error = tr("%1 was changed on the YubiKey since it was opened: nothing was written.").arg(blob);
+            op.outcome("changed on the YubiKey since read: not written");
+        } else {
+            *error = describe(status, detail, blob, tries, kind);
+        }
         return false;
     }
-    dropListing(serial);
     BlobInfo info;
     const auto fingerprint = find(serial, blob, &info, &status, &ignored)
                                  ? QByteArray::number(info.generation) + ":" + QByteArray::number(info.size)
@@ -924,7 +980,6 @@ bool DeviceStorage::removePasswordImpl(const QString& location, QString* error)
     int tries = -1;
     auto status = m_backend->remove(serial, passwd, pin, &detail, &tries);
     pin.fill('\0');
-    dropListing(serial);
     if (status != Ok) {
         if (status == WrongPin || status == PinBlocked || status == Replug || status == FewPinAttempts) {
             forgetPin(serial);
@@ -968,9 +1023,8 @@ bool DeviceStorage::storePasswordImpl(const QString& location, const QString& pa
     auto bytes = password.toUtf8();
     QString detail;
     int tries = -1;
-    auto status = m_backend->store(serial, passwd, bytes, true, pin, &detail, &tries);
+    auto status = m_backend->store(serial, passwd, bytes, true, false, pin, &detail, &tries);
     pin.fill('\0');
-    dropListing(serial);
     bytes.fill('\0');
     if (status != Ok) {
         if (status == WrongPin || status == PinBlocked || status == Replug || status == FewPinAttempts) {
@@ -1010,9 +1064,21 @@ bool DeviceStorage::read(const QString& location, QByteArray* data, QString* err
     return offGui([&] { return readImpl(location, data, error, mayAskPin); });
 }
 
-bool DeviceStorage::write(const QString& location, const QByteArray& data, QString* error)
+bool DeviceStorage::write(const QString& location,
+                          const QByteArray& data,
+                          QString* error,
+                          Status* status,
+                          bool ifUnchanged)
 {
-    return offGui([&] { return writeImpl(location, data, error); });
+    return offGui([&] { return writeImpl(location, data, error, status, ifUnchanged); });
+}
+
+bool DeviceStorage::refresh(const QString& serial, QString* error)
+{
+    if (m_quitting) {
+        return false;
+    }
+    return offGui([&] { return refreshImpl(serial, error); });
 }
 
 QStringList DeviceStorage::listVaults(const QString& serial, QString* error, Status* status)
@@ -1051,8 +1117,7 @@ DeviceStorage::PasswordStatus DeviceStorage::passwordStatus(const QString& locat
     if (m_quitting) {
         return {};
     }
-    // Every question answered from one listing, and the store kind kept
-    // for the run.
+    // Every question answered from the snapshot.
     return offGui([&] {
         PasswordStatus status;
         status.used = hasStoredPasswordImpl(location);
@@ -1085,11 +1150,6 @@ void DeviceStorage::setQuitting(bool quitting)
     m_quitting = quitting;
 }
 
-void DeviceStorage::setListingLifetime(int ms)
-{
-    m_listingLifetimeMs = ms;
-}
-
 void DeviceStorage::setPin(const QString& serial, const QString& pin)
 {
     forgetPin(serial);
@@ -1108,8 +1168,6 @@ void DeviceStorage::forgetPin(const QString& serial)
 void DeviceStorage::setBackend(std::unique_ptr<Backend> backend)
 {
     m_backend = backend ? std::move(backend) : defaultBackend();
-    m_listings.clear();
-    m_kinds.clear();
     m_backend->touchNotice = [this] {
         qCInfo(lcYubiKey) << "waiting for a touch";
         if (m_op) {
@@ -1150,6 +1208,4 @@ void DeviceStorage::clearCache()
 {
     m_cache.clear();
     m_toldUnencrypted.clear();
-    m_listings.clear();
-    m_kinds.clear();
 }

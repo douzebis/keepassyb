@@ -19,6 +19,7 @@
 
 #include <QCoreApplication>
 #include <QSet>
+#include <QSignalSpy>
 #include <QTest>
 #include <QThread>
 
@@ -31,191 +32,11 @@
 #include "format/KeePass2.h"
 #include "keys/PasswordKey.h"
 
+#include "mock/FakeDeviceBackend.h"
+
 QTEST_GUILESS_MAIN(TestDeviceStorage)
 
-namespace
-{
-    const QString Pin = QStringLiteral("654321");
-    const QString Location = QStringLiteral("yubikey:/Passwords.kdbx");
-
-    /// An in-memory YubiKey: blobs by name, each with a generation that
-    /// changes with every store, and whether yb encrypted it.
-    struct FakeDevice
-    {
-        QHash<QString, QByteArray> blobs;
-        QHash<QString, quint32> generations;
-        QSet<QString> encrypted;
-        DeviceStorage::StoreKind kind = DeviceStorage::StoreKind::Legacy;
-        /// A locked YubiKey: every operation with the PIN fails so.
-        DeviceStorage::Status locked = DeviceStorage::Ok;
-        quint32 nextGeneration = 1;
-        int fetches = 0;
-        int unverifiedFetches = 0;
-        int stores = 0;
-        int touches = 0;
-        int lists = 0;
-        int kinds = 0;
-        /// Whether a backend call ran on the GUI (main) thread.
-        bool calledOnMainThread = false;
-        int pinTries = 3;
-        bool full = false;
-    };
-
-    FakeDevice* fake = nullptr;
-
-    /// A stand-in for libyubiblob, following its documented contract (yb
-    /// specs 0039, 0028, 0044): listing needs no PIN; a wrong PIN is
-    /// WrongPin with the tries left; a missing blob is NotFound; a store
-    /// without room is StoreFull and writes nothing; post-quantum stores
-    /// ask for a touch per blob; reads without PIN refuse encrypted blobs.
-    class FakeBackend : public DeviceStorage::Backend
-    {
-    public:
-        DeviceStorage::Status list(const QString&, QList<DeviceStorage::BlobInfo>* blobs, QString*) override
-        {
-            ++fake->lists;
-            noteThread();
-            blobs->clear();
-            for (auto it = fake->blobs.constBegin(); it != fake->blobs.constEnd(); ++it) {
-                blobs->append({it.key(),
-                               static_cast<quint32>(it.value().size()),
-                               0,
-                               fake->generations.value(it.key()),
-                               fake->encrypted.contains(it.key())});
-            }
-            return DeviceStorage::Ok;
-        }
-
-        DeviceStorage::Status storeKind(const QString&, DeviceStorage::StoreKind* kind, QString*) override
-        {
-            ++fake->kinds;
-            noteThread();
-            *kind = fake->kind;
-            return DeviceStorage::Ok;
-        }
-
-        DeviceStorage::Status fetch(const QString&,
-                                    const QString& name,
-                                    const QByteArray& pin,
-                                    QByteArray* data,
-                                    QString* error,
-                                    int* pinTries) override
-        {
-            if (auto status = withPin(pin, error, pinTries); status != DeviceStorage::Ok) {
-                return status;
-            }
-            if (!fake->blobs.contains(name)) {
-                *error = "no blob named " + name;
-                return DeviceStorage::NotFound;
-            }
-            ++fake->fetches;
-            *data = fake->blobs.value(name);
-            return DeviceStorage::Ok;
-        }
-
-        DeviceStorage::Status
-        fetchUnencrypted(const QString&, const QString& name, QByteArray* data, QString* error) override
-        {
-            if (!fake->blobs.contains(name)) {
-                *error = "no blob named " + name;
-                return DeviceStorage::NotFound;
-            }
-            if (fake->encrypted.contains(name)) {
-                *error = name + " is encrypted";
-                return DeviceStorage::Encrypted;
-            }
-            ++fake->unverifiedFetches;
-            *data = fake->blobs.value(name);
-            return DeviceStorage::Ok;
-        }
-
-        DeviceStorage::Status store(const QString&,
-                                    const QString& name,
-                                    const QByteArray& data,
-                                    bool encrypt,
-                                    const QByteArray& pin,
-                                    QString* error,
-                                    int* pinTries) override
-        {
-            if (auto status = withPin(pin, error, pinTries); status != DeviceStorage::Ok) {
-                return status;
-            }
-            if (fake->full) {
-                *error = "not enough free objects";
-                return DeviceStorage::StoreFull;
-            }
-            ++fake->stores;
-            fake->blobs.insert(name, data);
-            fake->generations.insert(name, fake->nextGeneration++);
-            if (encrypt) {
-                fake->encrypted.insert(name);
-            } else {
-                fake->encrypted.remove(name);
-            }
-            return DeviceStorage::Ok;
-        }
-
-        DeviceStorage::Status
-        remove(const QString&, const QString& name, const QByteArray& pin, QString* error, int* pinTries) override
-        {
-            if (auto status = withPin(pin, error, pinTries); status != DeviceStorage::Ok) {
-                return status;
-            }
-            fake->blobs.remove(name);
-            fake->encrypted.remove(name);
-            return DeviceStorage::Ok;
-        }
-
-    private:
-        static void noteThread()
-        {
-            if (QThread::currentThread() == QCoreApplication::instance()->thread()) {
-                fake->calledOnMainThread = true;
-            }
-        }
-
-        DeviceStorage::Status withPin(const QByteArray& pin, QString* error, int* pinTries)
-        {
-            if (fake->locked != DeviceStorage::Ok) {
-                *error = "locked";
-                return fake->locked;
-            }
-            if (pin != Pin.toUtf8()) {
-                *pinTries = --fake->pinTries;
-                *error = "wrong PIN";
-                return DeviceStorage::WrongPin;
-            }
-            fake->pinTries = 3;
-            if (fake->kind == DeviceStorage::StoreKind::PostQuantum && touchNotice) {
-                ++fake->touches;
-                touchNotice();
-            }
-            return DeviceStorage::Ok;
-        }
-    };
-
-    QSharedPointer<CompositeKey> key()
-    {
-        auto k = QSharedPointer<CompositeKey>::create();
-        k->addKey(QSharedPointer<PasswordKey>::create("master"));
-        return k;
-    }
-
-    /// A new database saved to the fake YubiKey, as KDBX 4 (Argon2, made
-    /// fast for tests), the format of real vaults.
-    void saveNewDatabase(const QString& name)
-    {
-        auto db = QSharedPointer<Database>::create();
-        auto kdf = KeePass2::uuidToKdf(KeePass2::KDF_ARGON2D);
-        kdf->setRounds(1);
-        kdf->processParameters({{KeePass2::KDFPARAM_ARGON2_MEMORY, 1024}, {KeePass2::KDFPARAM_ARGON2_PARALLELISM, 1}});
-        db->changeKdf(kdf);
-        db->setKey(key());
-        db->metadata()->setName(name);
-        QString error;
-        QVERIFY2(db->saveAs(Location, Database::Atomic, {}, &error), qPrintable(error));
-    }
-} // namespace
+using namespace fakedevice;
 
 void TestDeviceStorage::initTestCase()
 {
@@ -233,9 +54,6 @@ void TestDeviceStorage::init()
     storage->setNotice({});
     storage->setTouchNotice({});
     storage->clearCache();
-    // Every test sees the fake YubiKey as it is now; the reuse of listings
-    // has its own tests.
-    storage->setListingLifetime(0);
     storage->setQuitting(false);
     storage->forgetPin("");
 }
@@ -336,6 +154,7 @@ void TestDeviceStorage::testChangedVaultIsFetchedAgain()
     // Elsewhere, the first version is stored back.
     fake->blobs.insert("Passwords.kdbx", stored);
     fake->generations.insert("Passwords.kdbx", fake->nextGeneration++);
+    yubiKeyChanged();
 
     auto db = QSharedPointer<Database>::create();
     QString error;
@@ -437,6 +256,7 @@ void TestDeviceStorage::testWrongPin()
 {
     saveNewDatabase("pin");
     fake->encrypted.insert("Passwords.kdbx");
+    yubiKeyChanged();
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     DeviceStorage::instance()->clearCache();
@@ -482,6 +302,7 @@ void TestDeviceStorage::testStoredMasterPassword()
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     fake->blobs.insert("Passwords.passwd", "correct horse\n");
     fake->encrypted.insert("Passwords.passwd");
+    yubiKeyChanged();
 #ifndef Q_OS_WIN
     QVERIFY(storage->hasStoredPassword(Location));
     QVERIFY(storage->readPassword(Location, &password, &error));
@@ -491,6 +312,7 @@ void TestDeviceStorage::testStoredMasterPassword()
 
     // Unencrypted: anyone holding the YubiKey could read it.
     fake->encrypted.remove("Passwords.passwd");
+    yubiKeyChanged();
     QVERIFY(!storage->hasStoredPassword(Location));
     QVERIFY(storage->readPassword(Location, &password, &error));
     QVERIFY(password.isEmpty());
@@ -500,6 +322,7 @@ void TestDeviceStorage::testStoredMasterPassword()
     fake->kind = DeviceStorage::StoreKind::Legacy;
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
     fake->encrypted.insert("Passwords.passwd");
+    yubiKeyChanged();
     QVERIFY(!storage->hasStoredPassword(Location));
     QVERIFY(storage->readPassword(Location, &password, &error));
     QVERIFY(password.isEmpty());
@@ -517,6 +340,7 @@ void TestDeviceStorage::testEncryptedVaultIsRewrittenUnencrypted()
 {
     saveNewDatabase("old");
     fake->encrypted.insert("Passwords.kdbx");
+    yubiKeyChanged();
     QStringList notices;
     DeviceStorage::instance()->setNotice([&notices](const QString& message) { notices << message; });
 
@@ -584,6 +408,8 @@ void TestDeviceStorage::testLockedYubiKeyFallback()
         bytes[11] = 0;
         fake->blobs.insert("Passwords.kdbx", bytes);
         fake->generations.insert("Passwords.kdbx", fake->nextGeneration++);
+        yubiKeyChanged();
+        yubiKeyChanged();
     };
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
     DeviceStorage::instance()->clearCache(); // a reformat, for the caches
@@ -612,12 +438,15 @@ void TestDeviceStorage::testLockedYubiKeyFallback()
     QVERIFY(sawKdbx3);
     agree = true;
     fake->generations.insert("Passwords.kdbx", fake->nextGeneration++);
+    yubiKeyChanged();
     QVERIFY2(DeviceStorage::instance()->read(Location, &data, &error), qPrintable(error));
     QCOMPARE(prompts, 2);
 
     // An encrypted vault cannot be read without the PIN.
     fake->encrypted.insert("Passwords.kdbx");
+    yubiKeyChanged();
     fake->generations.insert("Passwords.kdbx", fake->nextGeneration++);
+    yubiKeyChanged();
     QVERIFY(!DeviceStorage::instance()->read(Location, &data, &error));
     QCOMPARE(prompts, 2);
 }
@@ -660,57 +489,108 @@ void TestDeviceStorage::testRememberPassword()
 #endif
 }
 
-/// The unlock dialog's questions and a header read cost one listing and
-/// one store-kind query (yb spec 0047 S2).
-void TestDeviceStorage::testOneListingPerAction()
+/// Opening a vault reads the YubiKey once (yb spec 0050 S1): the unlock
+/// dialog's refresh serves its questions, the header read, and the unlock.
+void TestDeviceStorage::testOneReadToOpen()
 {
-    saveNewDatabase("one listing");
+    saveNewDatabase("one read");
     fake->kind = DeviceStorage::StoreKind::PostQuantum;
     fake->blobs.insert("Passwords.passwd", "secret");
+    yubiKeyChanged();
     auto* storage = DeviceStorage::instance();
     storage->clearCache();
-    storage->setListingLifetime(60000);
     // As after a lock: the PIN is forgotten before the locked view loads.
     storage->forgetPin("");
-    fake->lists = 0;
-    fake->kinds = 0;
+    fake->refreshes = 0;
 
     QString error;
+    QVERIFY(storage->refresh({}, &error));
     QSharedPointer<Database>::create()->open(Location, nullptr, &error);
     const auto status = storage->passwordStatus(Location);
     QVERIFY(!status.used);
     QVERIFY(!status.ignoredReason.isEmpty());
-    QVERIFY(storage->hasStoredPassword(Location) == status.used);
-    QCOMPARE(fake->lists, 1);
-    QCOMPARE(fake->kinds, 1);
+    auto db = QSharedPointer<Database>::create();
+    QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
+    QCOMPARE(fake->refreshes, 1);
     // The header read of a KDBX 4 vault reads it without the PIN (S4).
     QCOMPARE(fake->fetches, 0);
     QCOMPARE(fake->unverifiedFetches, 1);
 }
 
-/// KeePassYB's own write drops the listing; it also expires.
-void TestDeviceStorage::testListingIsDroppedAfterAWriteAndExpires()
+/// Questions are answered from the snapshot until a refresh; KeePassYB's
+/// own writes keep it up to date (yb spec 0050 S1).
+void TestDeviceStorage::testSnapshotUntilRefresh()
 {
     auto* storage = DeviceStorage::instance();
-    storage->setListingLifetime(60000);
     saveNewDatabase("first");
     QString error;
-    storage->listVaults({}, &error);
-    const auto lists = fake->lists;
-    storage->listVaults({}, &error);
-    QCOMPARE(fake->lists, lists);
+    QCOMPARE(storage->listVaults({}, &error), QStringList({"Passwords.kdbx"}));
 
-    // A write: the next question lists again, and sees it.
-    saveNewDatabase("second");
-    fake->lists = 0;
-    storage->listVaults({}, &error);
-    QCOMPARE(fake->lists, 0); // the write's own fresh listing is reused
-
-    // Changed elsewhere: seen once the listing expires.
+    // Another program stores a vault: not seen until a refresh.
     fake->blobs.insert("Other.kdbx", "x");
     QVERIFY(!storage->listVaults({}, &error).contains("Other.kdbx"));
-    storage->setListingLifetime(0);
+    QVERIFY(storage->refresh({}, &error));
     QVERIFY(storage->listVaults({}, &error).contains("Other.kdbx"));
+
+    // A vault missing from the snapshot is looked for again.
+    fake->blobs.insert("Late.kdbx", fake->blobs.value("Passwords.kdbx"));
+    QByteArray data;
+    QVERIFY2(storage->read(DeviceStorage::location({}, "Late.kdbx"), &data, &error), qPrintable(error));
+}
+
+/// A save is one store call: no listing or refresh reads the YubiKey
+/// around it (yb spec 0050 S1).
+void TestDeviceStorage::testSaveIsOneStoreCall()
+{
+    saveNewDatabase("save");
+    auto db = QSharedPointer<Database>::create();
+    QString error;
+    QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
+    fake->refreshes = 0;
+    const auto stores = fake->stores;
+    db->metadata()->setName("saved");
+    QVERIFY2(db->save(Database::Atomic, {}, &error), qPrintable(error));
+    QCOMPARE(fake->stores, stores + 1);
+    QCOMPARE(fake->refreshes, 0);
+}
+
+/// A vault changed on the YubiKey since it was opened is not overwritten:
+/// the save fails, writing nothing, and asks the user (KeePassXC's merge,
+/// as for a file changed on disk); Overwrite then writes it (yb spec 0050
+/// S3).
+void TestDeviceStorage::testChangedOnTheYubiKey()
+{
+    saveNewDatabase("mine");
+    auto db = QSharedPointer<Database>::create();
+    QString error;
+    QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
+
+    // Another program saves the vault meanwhile: its own session, so
+    // KeePassYB's snapshot does not see it.
+    const auto snapBlobs = fake->snapBlobs;
+    const auto snapGenerations = fake->snapGenerations;
+    auto theirs = QSharedPointer<Database>::create();
+    QVERIFY2(theirs->open(Location, key(), &error), qPrintable(error));
+    theirs->metadata()->setName("theirs");
+    QVERIFY2(theirs->save(Database::Atomic, {}, &error), qPrintable(error));
+    fake->snapBlobs = snapBlobs;
+    fake->snapGenerations = snapGenerations;
+    const auto onCard = fake->blobs.value("Passwords.kdbx");
+
+    QSignalSpy asked(db.data(), &Database::databaseFileChanged);
+    db->metadata()->setName("mine again");
+    QVERIFY(!db->save(Database::Atomic, {}, &error));
+    QVERIFY2(error.contains("changed on the YubiKey"), qPrintable(error));
+    QCOMPARE(fake->blobs.value("Passwords.kdbx"), onCard);
+    QVERIFY(db->isModified());
+    QTRY_COMPARE(asked.count(), 1);
+    QCOMPARE(asked.first().first().toBool(), true);
+
+    // Overwrite.
+    db->setIgnoreFileChangesUntilSaved(true);
+    QVERIFY2(db->save(Database::Atomic, {}, &error), qPrintable(error));
+    QVERIFY(fake->blobs.value("Passwords.kdbx") != onCard);
+    QVERIFY(!db->ignoreFileChangesUntilSaved());
 }
 
 /// While quitting, reads and questions do not reach the YubiKey; a write
@@ -791,4 +671,29 @@ void TestDeviceStorage::testUnchangedContentIsDetected()
     // Saved: the new content is the reference.
     QVERIFY2(db->save(Database::Atomic, {}, &error), qPrintable(error));
     QVERIFY(db->deviceContentUnchanged());
+}
+
+/// A change another program made that a refresh has already brought into
+/// the snapshot (another dialog opened meanwhile) is a conflict all the
+/// same: the database is based on an older version (yb spec 0050 S3).
+void TestDeviceStorage::testChangeSeenByARefreshIsStillAConflict()
+{
+    saveNewDatabase("mine");
+    auto db = QSharedPointer<Database>::create();
+    QString error;
+    QVERIFY2(db->open(Location, key(), &error), qPrintable(error));
+
+    auto theirs = QSharedPointer<Database>::create();
+    QVERIFY2(theirs->open(Location, key(), &error), qPrintable(error));
+    theirs->metadata()->setName("theirs");
+    QVERIFY2(theirs->save(Database::Atomic, {}, &error), qPrintable(error));
+    QVERIFY(DeviceStorage::instance()->refresh({}, &error));
+    const auto onCard = fake->blobs.value("Passwords.kdbx");
+
+    QSignalSpy asked(db.data(), &Database::databaseFileChanged);
+    db->metadata()->setName("mine again");
+    QVERIFY(!db->save(Database::Atomic, {}, &error));
+    QVERIFY2(error.contains("changed on the YubiKey"), qPrintable(error));
+    QCOMPARE(fake->blobs.value("Passwords.kdbx"), onCard);
+    QTRY_COMPARE(asked.count(), 1);
 }
