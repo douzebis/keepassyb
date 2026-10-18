@@ -23,15 +23,19 @@ KeePassXC.**
   passwords:
   - **Legacy stores** (yb's PIV store): the database opens without the
     YubiKey's PIN, which is needed only to save.
-  - **Post-quantum stores** (yb's FIDO2 store): opening needs the FIDO2 PIN
-    and a touch.  If the YubiKey is locked (blocked PIN, FIDO2 reset…),
-    KeePassYB offers to open the database anyway, without the YubiKey's own
-    integrity check; your master password still protects it.
+  - **Post-quantum stores** (yb's FIDO2 store): a KDBX 4 database opens
+    without the FIDO2 PIN or a touch, which are needed only to save (KDBX 4
+    checks its own integrity); a KDBX 3.1 one needs them to open too.  If
+    the YubiKey is locked (blocked PIN, FIDO2 reset…), KeePassYB offers to
+    open the database anyway, without the YubiKey's own integrity check;
+    your master password still protects it.
 - **The master password on the YubiKey** (`<database>.passwd`), so that
   the YubiKey and its FIDO2 PIN replace typing it.  This works only for a
   post-quantum store, stored encrypted.  The unlock dialog offers it.  A
   `.passwd` stored any other way is not used, and KeePassYB offers to
   delete it.
+
+Every change to KeePassXC, and why: [KEEPASSYB.md](KEEPASSYB.md).
 
 ## Differences from KeePassXC
 
