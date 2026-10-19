@@ -33,6 +33,7 @@
 
 #include "autotype/AutoType.h"
 #include "core/AsyncTask.h"
+#include "core/DeviceStorage.h"
 #include "core/EntrySearcher.h"
 #include "core/Merger.h"
 #include "core/Tools.h"
@@ -232,6 +233,17 @@ DatabaseWidget::DatabaseWidget(QSharedPointer<Database> db, QWidget* parent)
     m_autosaveTimer = new QTimer(this);
     m_autosaveTimer->setSingleShot(true);
     connect(m_autosaveTimer, SIGNAL(timeout()), this, SLOT(onAutosaveDelayTimeout()));
+
+    // A database on a device saves a few seconds after the last change, so
+    // that a burst of edits makes one (slow) device write.
+    m_deviceSaveTimer = new QTimer(this);
+    m_deviceSaveTimer->setSingleShot(true);
+    m_deviceSaveTimer->setInterval(DeviceSaveDelayMs);
+    connect(m_deviceSaveTimer, &QTimer::timeout, this, [this] {
+        if (m_db->isModified()) {
+            save();
+        }
+    });
 
     m_searchLimitGroup = config()->get(Config::SearchLimitGroup).toBool();
 
@@ -1845,10 +1857,20 @@ void DatabaseWidget::onGroupChanged()
     emit groupChanged();
 }
 
+bool DatabaseWidget::isOnDevice() const
+{
+    return DeviceStorage::isDeviceLocation(m_db->filePath());
+}
+
 void DatabaseWidget::onDatabaseModified()
 {
     refreshSearch();
     m_remoteSettings->loadSettings();
+    if (isOnDevice()) {
+        // Write-through, after the delay; whatever the auto-save settings.
+        m_deviceSaveTimer->start();
+        return;
+    }
     int autosaveDelayMs = m_db->metadata()->autosaveDelayMin() * 60 * 1000; // min to msec for QTimer
     bool autosaveAfterEveryChangeConfig = config()->get(Config::AutoSaveAfterEveryChange).toBool();
     if (autosaveDelayMs > 0 && autosaveAfterEveryChangeConfig) {
@@ -1888,6 +1910,11 @@ void DatabaseWidget::triggerAutosaveTimer()
 
 void DatabaseWidget::onDatabaseNonDataChanged()
 {
+    // A database on a device is never written for non-data changes alone
+    // (an expanded group…): device writes are slow and wear the device.
+    if (isOnDevice()) {
+        return;
+    }
     // Force mark the database modified if we are not auto-saving non-data changes
     if (!config()->get(Config::AutoSaveNonDataChanges).toBool()) {
         m_db->markAsModified();
@@ -2067,9 +2094,11 @@ bool DatabaseWidget::lock()
 
     if (m_db->isModified()) {
         bool saved = false;
-        // Attempt to save on exit, but don't block locking if it fails
-        if (config()->get(Config::AutoSaveOnExit).toBool()
-            || config()->get(Config::AutoSaveAfterEveryChange).toBool()) {
+        // Attempt to save on exit, but don't block locking if it fails.  A
+        // database on a device saves its pending changes now.
+        if (config()->get(Config::AutoSaveOnExit).toBool() || config()->get(Config::AutoSaveAfterEveryChange).toBool()
+            || isOnDevice()) {
+            m_deviceSaveTimer->stop();
             saved = save();
 
             if (!saved) {
@@ -2107,10 +2136,16 @@ bool DatabaseWidget::lock()
                 return false;
             }
         }
-    } else if (m_db->hasNonDataChanges() && config()->get(Config::AutoSaveNonDataChanges).toBool()) {
+    } else if (m_db->hasNonDataChanges() && config()->get(Config::AutoSaveNonDataChanges).toBool() && !isOnDevice()) {
         // Silently auto-save non-data changes, ignore errors
         QString errorMessage;
         performSave(errorMessage);
+    }
+
+    // The device's PIN is held only while the database is unlocked.
+    QString serial, blob;
+    if (DeviceStorage::parse(m_db->filePath(), &serial, &blob)) {
+        DeviceStorage::instance()->forgetPin(serial);
     }
 
     if (m_groupView->currentGroup()) {
@@ -2558,6 +2593,23 @@ bool DatabaseWidget::saveAs()
         return false;
     }
 
+    // With a YubiKey set up for yb connected, it is offered next to a file.
+    QString location;
+    if (!chooseSaveLocation(&location)) {
+        return false;
+    }
+    if (!location.isEmpty()) {
+        QString errorMessage;
+        if (!performSave(errorMessage, location)) {
+            showMessage(tr("Writing the database failed: %1").arg(errorMessage),
+                        MessageWidget::Error,
+                        true,
+                        MessageWidget::LongAutoHideTimeout);
+            return false;
+        }
+        return true;
+    }
+
     QString oldFilePath = m_db->filePath();
     if (!QFileInfo::exists(oldFilePath)) {
         QString defaultFileName = config()->get(Config::DefaultDatabaseFileName).toString();
@@ -2571,7 +2623,8 @@ bool DatabaseWidget::saveAs()
     bool ok = false;
     if (!newFilePath.isEmpty()) {
         QString errorMessage;
-        if (!performSave(errorMessage, newFilePath)) {
+        ok = performSave(errorMessage, newFilePath);
+        if (!ok) {
             showMessage(tr("Writing the database failed: %1").arg(errorMessage),
                         MessageWidget::Error,
                         true,
@@ -2580,6 +2633,97 @@ bool DatabaseWidget::saveAs()
     }
 
     return ok;
+}
+
+/**
+ * Where Save As writes: when a YubiKey set up for yb is connected, ask
+ * whether to save on it (and under which name) or to a file.
+ *
+ * @param location the YubiKey location chosen, or empty for a file
+ * @return false if the user cancelled
+ */
+bool DatabaseWidget::chooseSaveLocation(QString* location)
+{
+    location->clear();
+    QString error;
+    DeviceStorage::Status status;
+    auto vaults = DeviceStorage::instance()->listVaults({}, &error, &status);
+    const bool severalYubiKeys = status == DeviceStorage::SeveralDevices;
+    if (!error.isEmpty() && !severalYubiKeys) {
+        // No YubiKey (or no yb store on it): a file, as always.
+        return true;
+    }
+
+    const auto aFile = tr("A file…");
+    const auto onYubiKey = tr("On the YubiKey…");
+    const auto otherYubiKey = tr("On a YubiKey chosen by serial number…");
+    // The serial number only matters to choose among several YubiKeys.
+    QStringList choices{aFile};
+    if (severalYubiKeys) {
+        choices << otherYubiKey;
+    } else {
+        choices << onYubiKey;
+    }
+    bool ok = false;
+    const auto choice =
+        QInputDialog::getItem(this,
+                              tr("Save database as"),
+                              severalYubiKeys ? tr("Save (several YubiKeys are connected):") : tr("Save:"),
+                              choices,
+                              0,
+                              false,
+                              &ok);
+    if (!ok) {
+        return false;
+    }
+    if (choice == aFile) {
+        return true;
+    }
+
+    QString serial;
+    if (choice == otherYubiKey) {
+        serial = QInputDialog::getText(
+                     this, tr("Save database as"), tr("YubiKey serial number:"), QLineEdit::Normal, {}, &ok)
+                     .trimmed();
+        if (!ok || serial.isEmpty()) {
+            return false;
+        }
+        vaults = DeviceStorage::instance()->listVaults(serial, &error);
+        if (!error.isEmpty()) {
+            showMessage(error, MessageWidget::Error);
+            return false;
+        }
+    }
+
+    auto suggested = DeviceStorage::vaultName(m_db->metadata()->name());
+    if (suggested.isEmpty()) {
+        suggested = DeviceStorage::vaultName(tr("Passwords"));
+    }
+    const auto input = QInputDialog::getText(
+        this, tr("Save database as"), tr("Name on the YubiKey:"), QLineEdit::Normal, suggested, &ok);
+    if (!ok) {
+        return false;
+    }
+    const auto name = DeviceStorage::vaultName(input);
+    if (name.isEmpty()) {
+        showMessage(tr("A database on a YubiKey needs a name without \"/\", of at most 255 bytes."),
+                    MessageWidget::Error);
+        return false;
+    }
+    if (vaults.contains(name)) {
+        auto answer = MessageBox::question(
+            this,
+            tr("Replace database?"),
+            tr("A database named %1 is already on the YubiKey. Replace it?").arg(name.toHtmlEscaped()),
+            MessageBox::Overwrite | MessageBox::Cancel,
+            MessageBox::Cancel);
+        if (answer != MessageBox::Overwrite) {
+            return false;
+        }
+    }
+
+    *location = DeviceStorage::location(serial, name);
+    return true;
 }
 
 bool DatabaseWidget::performSave(QString& errorMessage, const QString& fileName)

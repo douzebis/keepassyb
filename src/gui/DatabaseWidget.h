@@ -347,6 +347,10 @@ private:
 
     // Autosave delay
     QPointer<QTimer> m_autosaveTimer;
+    QPointer<QTimer> m_deviceSaveTimer;
+    static constexpr int DeviceSaveDelayMs = 5000;
+    bool isOnDevice() const;
+    bool chooseSaveLocation(QString* location);
 
     // Auto-Type related
     QString m_searchStringForAutoType;
